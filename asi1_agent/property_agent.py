@@ -1,0 +1,498 @@
+"""
+ASI1 Property Finder agent: receives ChatMessage, parses intent, updates state,
+calls Repliers, formats response, sends ChatMessage reply.
+"""
+import os
+import re
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from dotenv import load_dotenv
+from uagents import Agent, Context, Protocol
+from uagents_core.contrib.protocols.chat import (
+    ChatMessage,
+    ChatAcknowledgement,
+    TextContent,
+    chat_protocol_spec,
+)
+
+from .nl_parser import parse_filters
+from .llm_parser import llm_interpret
+from .state_manager import get_state, merge_parsed_into_state, next_page
+
+# Ensure project root is on path so we can import property_finder.repliers_client
+import sys
+from pathlib import Path
+_agent_dir = Path(__file__).resolve().parent
+_project_root = _agent_dir.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from property_finder.repliers_client.client import search_listings, fetch_listing_by_mls
+from property_finder.repliers_client.formatter import (
+    format_listings as format_listings_text,
+    format_listing_details,
+    format_listing_full,
+)
+from .sheets_export import write_listings_to_sheet, create_simple_sheet, get_listings_table
+from .asi1_api import chat as asi1_chat, create_sheet_with_listings as asi1_create_sheet_with_listings
+
+# Load .env from asi1_agent directory so it works when run from project root
+load_dotenv(_agent_dir / ".env")
+
+# --- Agent setup (ASI1 compatible) ---
+agent_seed = os.getenv("AGENT_SECRET_KEY_1")
+if not agent_seed:
+    raise ValueError("AGENT_SECRET_KEY_1 not set in .env")
+
+agent_port = int(os.getenv("AGENT_PORT", "8000"))
+use_mailbox = os.getenv("USE_MAILBOX", "true").lower() == "true"
+agent_endpoint = os.getenv("AGENT_ENDPOINT_URL")
+
+agent_kwargs = {
+    "name": "Property Finder",
+    "seed": agent_seed,
+    "port": agent_port,
+}
+if use_mailbox:
+    agent_kwargs["mailbox"] = True
+elif agent_endpoint:
+    agent_kwargs["endpoint"] = [f"{agent_endpoint}/submit"]
+
+agent = Agent(**agent_kwargs)
+
+# --- Chat protocol ---
+chat_proto = Protocol(spec=chat_protocol_spec)
+
+# Keep last page of listings per session so the user can say
+# "the second one" and get more details.
+from typing import Any
+
+_LAST_RESULTS: dict[str, list[dict[str, Any]]] = {}
+# Simple in-memory wishlist per session (no persistence across restarts)
+_WISHLISTS: dict[str, list[dict[str, Any]]] = {}
+# Track the last listing index the user explicitly referenced (e.g. via 'details 2')
+_LAST_SELECTED_INDEX: dict[str, int] = {}
+
+
+def _get_user_text(msg: ChatMessage) -> str | None:
+    """Extract user text from ChatMessage content (TextContent)."""
+    for item in (msg.content or []):
+        if hasattr(item, "text"):
+            return getattr(item, "text", None) or None
+    return None
+
+
+def _strip_agent_mention(text: str) -> str:
+    """
+    Remove a leading @agent... mention that ASI1 often prepends, e.g.:
+    '@agent1abc... more' -> 'more'
+    """
+    if not text:
+        return ""
+    return re.sub(r"^@\S+\s+", "", text).strip()
+
+
+def _normalize_text(text: str) -> str:
+    """Strip, lower, collapse spaces, remove trailing punctuation."""
+    if not text:
+        return ""
+    t = (text or "").strip().lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.rstrip(".")
+    return t
+
+
+def _parse_create_sheet_fallback(text: str) -> dict | None:
+    """
+    If the message clearly asks to create a sheet (e.g. 'create a google sheet and add my name Chayan Shah'),
+    return a minimal sheet_request so we can create a sheet without LLM. Otherwise return None.
+    """
+    t = _normalize_text(text)
+    if "create" not in t or "sheet" not in t:
+        return None
+    # Try "add my name X" or "add name X" on original text to preserve casing
+    m = re.search(r"add\s+(?:my\s+)?name\s+([^.]+?)(?:\s+in\s+it|\s*$|\.)", (text or "").strip(), re.I)
+    if m:
+        name = m.group(1).strip()
+        if name:
+            return {
+                "title": f"{name} - Personal Information",
+                "rows": [["Name", name]],
+            }
+    return {"title": "Sheet from Property Finder", "rows": [["Content", (text or "").strip()[:500]]]}
+
+
+def _is_more_request(text: str) -> bool:
+    t = _normalize_text(text)
+    if t in ("more", "more listings", "next", "next page"):
+        return True
+    # Treat simple variants like "more options", "more places", "more apartments in austin" as 'more'
+    if t.startswith("more "):
+        return True
+    return False
+
+
+def _is_refinement_only(text: str) -> bool:
+    """True if message looks like a refinement (e.g. 'under 550k', 'only condos') not a full new search."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Refinement-like: short, no "find" / "search" / "looking for"
+    refinement_starters = ("refine", "under", "only", "change to", "make it", "filter", "just", "max ")
+    if any(t.startswith(p) or p in t for p in refinement_starters):
+        return True
+    if t.isdigit() or re.match(r"^\d+\s*bed", t):
+        return True
+    if re.search(r"under\s*\$\d|under\s*\d+k", t):
+        return True
+    return False
+
+
+def _parse_wishlist_command(text: str) -> tuple[str, int | None] | None:
+    """
+    Detect simple wishlist commands.
+    Returns (action, index) where action is one of:
+    - 'wishlist_add' with index (1-based) to save a listing
+    - 'wishlist_show' with index=None
+    - 'wishlist_clear' with index=None
+    or None if not a wishlist-related message.
+    """
+    if not text:
+        return None
+    t = _normalize_text(text)
+    if "wishlist" not in t and "favorite" not in t and "favourite" not in t and "saved" not in t:
+        return None
+
+    # Clear wishlist
+    if any(word in t for word in ("clear wishlist", "empty wishlist", "reset wishlist", "remove all")):
+        return ("wishlist_clear", None)
+
+    # Add the last referenced listing if user says "add this/it to my wishlist"
+    if any(
+        phrase in t
+        for phrase in (
+            "add this to my wishlist",
+            "add it to my wishlist",
+            "save this to my wishlist",
+            "save it to my wishlist",
+            "add to my wishlist",
+            "save to my wishlist",
+        )
+    ):
+        return ("wishlist_add", None)
+
+    # Add a specific listing to wishlist (look for a number or ordinal)
+    idx: int | None = None
+    m = re.search(r"\b(\d+)\b", t)
+    if m:
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            idx = None
+    else:
+        ordinals = {
+            "first": 1,
+            "1st": 1,
+            "second": 2,
+            "2nd": 2,
+            "third": 3,
+            "3rd": 3,
+            "fourth": 4,
+            "4th": 4,
+            "fifth": 5,
+            "5th": 5,
+        }
+        for word, val in ordinals.items():
+            if word in t:
+                idx = val
+                break
+
+    if idx is not None:
+        return ("wishlist_add", idx)
+
+    # Show wishlist (no clear add intent but mentions wishlist/favorites)
+    if any(
+        word in t
+        for word in (
+            "show wishlist",
+            "my wishlist",
+            "view wishlist",
+            "see wishlist",
+            "saved listings",
+            "my saved",
+        )
+    ):
+        return ("wishlist_show", None)
+
+    # Fallback: treat as show wishlist
+    return ("wishlist_show", None)
+
+
+def _detect_intent(text: str, has_existing_state: bool) -> str:
+    """Returns: 'new_search' | 'refinement' | 'more'."""
+    if _is_more_request(text):
+        return "more"
+    if has_existing_state and _is_refinement_only(text):
+        return "refinement"
+    return "new_search"
+
+
+def _search_summary(state: dict) -> str:
+    """Short label for the search (used as sheet title)."""
+    parts = []
+    if state.get("location"):
+        parts.append(str(state["location"]))
+    if state.get("bedrooms"):
+        parts.append(f"{state['bedrooms']}br")
+    if state.get("max_price"):
+        parts.append(f"under ${state['max_price']:,}")
+    if state.get("deal_type") == "rent":
+        parts.append("rental")
+    return " ".join(parts) or "Property search"
+
+
+async def _handle_search(ctx: Context, sender: str, session_id: str, state: dict) -> str:
+    """Call Repliers, format listings, optionally export to Google Sheet, return reply text."""
+    export_page_size = int(os.getenv("GOOGLE_SHEETS_EXPORT_PAGE_SIZE", "50"))
+    try:
+        listings, meta = search_listings(state, export_page_size=export_page_size)
+        # Save results for follow-up "details" questions, but only if we actually got some
+        if listings:
+            _LAST_RESULTS[session_id] = listings
+        has_more = meta.get("has_more", False)
+        reply = format_listings_text(
+            listings,
+            location=state.get("location"),
+            max_price=state.get("max_price"),
+            page=state.get("page", 1),
+            has_more=has_more,
+        )
+        # Export full list to a Google Sheet and add link:
+        # Prefer your Google service account (GOOGLE_APPLICATION_CREDENTIALS),
+        # and only fall back to ASI:One if that is not available.
+        all_listings = meta.get("all_listings") or listings
+        if all_listings:
+            summary = _search_summary(state)
+            title = f"Property Finder – {summary}"
+            headers, table_rows = get_listings_table(all_listings)
+            # First, try direct Google Sheets export via your service account
+            sheet_url = write_listings_to_sheet(all_listings, search_summary=summary)
+            # If that fails (e.g. creds missing), optionally try ASI:One helper
+            if not sheet_url:
+                sheet_url = asi1_create_sheet_with_listings(title, headers, table_rows)
+            if sheet_url:
+                reply += f"\n\n📎 Full results ({len(all_listings)} listings) have been added to a spreadsheet. Click to view: {sheet_url}"
+        return reply
+    except ValueError as e:
+        return f"Configuration error: {e}. Please set REPLIERS_API_KEY."
+    except Exception as e:
+        return f"Sorry, I couldn't fetch listings right now: {e}. Please try again or rephrase."
+
+
+@chat_proto.on_message(ChatMessage)
+async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
+    """Handle incoming chat: parse intent, update state, call API, reply."""
+    # Key state by sender so the same user keeps filters across messages (ASI1 may change session per message)
+    session_id = str(sender)
+    user_text = _get_user_text(msg)
+    # ASI1 messages often start with an @agent... mention; strip it so intent detection works
+    user_text = _strip_agent_mention(user_text)
+    if not user_text:
+        reply = ChatMessage(
+            content=[TextContent(type="text", text="Send me a property search, e.g. \"Find 2 bedroom homes under $600k in Austin.\"")],
+            msg_id=uuid4(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await ctx.send(sender, reply)
+        return
+
+    # Optional: send ack for long-running work
+    try:
+        ack = ChatAcknowledgement(
+            acknowledged_msg_id=msg.msg_id,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await ctx.send(sender, ack)
+    except Exception:
+        pass
+
+    current_state = get_state(session_id)
+    has_state = any(
+        current_state.get(k) is not None
+        for k in ("location", "max_price", "bedrooms", "property_type", "deal_type")
+    )
+    # First, handle wishlist commands (save/show/clear) before normal intent flow
+    wishlist_cmd = _parse_wishlist_command(user_text)
+    if wishlist_cmd:
+        action, idx = wishlist_cmd
+        listings = _LAST_RESULTS.get(session_id) or []
+        if action == "wishlist_add":
+            # If no explicit index was provided (e.g. "add this to my wishlist"),
+            # fall back to the last listing the user referenced (via 'details N').
+            if (idx is None or not isinstance(idx, int)) and session_id in _LAST_SELECTED_INDEX:
+                idx = _LAST_SELECTED_INDEX.get(session_id)
+
+            if not listings:
+                reply_text = (
+                    "Do a property search first, then say something like "
+                    "\"save 2 to my wishlist\" or \"add the first one to my favorites.\""
+                )
+            elif not idx or not (1 <= int(idx) <= len(listings)):
+                reply_text = (
+                    "I couldn't match that to a listing. After a search you can say "
+                    "\"save 1 to my wishlist\" or \"add the second one to favorites.\""
+                )
+            else:
+                listing = listings[int(idx) - 1]
+                wl = _WISHLISTS.setdefault(session_id, [])
+                wl.append(listing)
+                reply_text = (
+                    f"I've added listing #{idx} to your wishlist.\n\n"
+                    "Say \"show my wishlist\" to see everything you've saved in this chat."
+                )
+        elif action == "wishlist_show":
+            saved = _WISHLISTS.get(session_id) or []
+            if not saved:
+                reply_text = (
+                    "Your wishlist is empty.\n\n"
+                    "After a search you can save a result by saying "
+                    "\"save 1 to my wishlist\" or \"add the second one to favorites.\""
+                )
+            else:
+                # Reuse listing formatter for consistency
+                body = format_listings_text(
+                    saved,
+                    location=None,
+                    max_price=None,
+                    page=1,
+                    has_more=False,
+                )
+                # Tweak the header text slightly
+                if body.startswith("Here are the listings:"):
+                    body = body.replace("Here are the listings:", "Here are your saved listings:", 1)
+                reply_text = body
+        else:  # wishlist_clear
+            if session_id in _WISHLISTS:
+                _WISHLISTS.pop(session_id, None)
+                reply_text = "Your wishlist has been cleared for this chat."
+            else:
+                reply_text = "Your wishlist is already empty."
+
+        reply = ChatMessage(
+            content=[TextContent(type="text", text=reply_text)],
+            msg_id=uuid4(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await ctx.send(sender, reply)
+        return
+
+    # Otherwise, let local logic handle explicit "more"
+    intent = _detect_intent(user_text, has_state)
+
+    # Optionally use OpenAI to interpret complex natural language into filters/intent
+    llm_result = None
+    if intent != "more":  # no need to call LLM for simple 'more'
+        try:
+            llm_result = llm_interpret(user_text, current_state)
+        except Exception:
+            llm_result = None
+        if llm_result and isinstance(llm_result, dict):
+            llm_intent = llm_result.get("intent")
+            # Let the LLM refine searches and pick details/sheet intents,
+            # but do not let it override our local 'more' detection.
+            if llm_intent in ("new_search", "refinement", "details", "create_sheet"):
+                intent = llm_intent
+
+    # Fallback: user said "create a google sheet" but LLM didn't return create_sheet
+    if intent != "create_sheet" and _parse_create_sheet_fallback(user_text):
+        intent = "create_sheet"
+        if not (isinstance(llm_result, dict) and isinstance(llm_result.get("sheet_request"), dict)):
+            llm_result = llm_result or {}
+            llm_result["sheet_request"] = _parse_create_sheet_fallback(user_text)
+
+    if intent == "create_sheet":
+        # Prefer ASI:One API so we use the platform's Google Sheets capability (like CHAI) when user is tagged to us
+        asi1_reply = asi1_chat(user_text)
+        if asi1_reply:
+            reply_text = asi1_reply
+        else:
+            sr = (llm_result or {}).get("sheet_request") if isinstance(llm_result, dict) else None
+            if sr and isinstance(sr, dict) and sr.get("title") and isinstance(sr.get("rows"), list):
+                sheet_url = create_simple_sheet(sr["title"], sr["rows"])
+                if sheet_url:
+                    reply_text = f"I've created a Google Sheet for you.\n\n📊 Title: {sr['title']}\n\n📎 Open in Google Sheets: {sheet_url}\n\nYou can add or edit content directly in the sheet."
+                else:
+                    reply_text = "I couldn't create the sheet right now (Google credentials may not be set). Try again later or ask for a property search."
+            else:
+                reply_text = "I can create a Google Sheet for you. Try something like: \"Create a Google Sheet and add my name Chayan Shah\" and I'll add that to a new sheet and share the link."
+    elif intent == "more":
+        if not has_state:
+            reply_text = (
+                "Do a search first (e.g. \"Find 2 bedroom homes under $600k in Austin\"), "
+                "then say \"more\" to see the next page of results."
+            )
+        else:
+            state = next_page(session_id)
+            reply_text = await _handle_search(ctx, sender, session_id, state)
+    elif intent == "details":
+        listings = _LAST_RESULTS.get(session_id) or []
+        idx = None
+        if llm_result and isinstance(llm_result, dict):
+            idx = llm_result.get("listing_index")
+        if not listings or not idx or not (1 <= int(idx) <= len(listings)):
+            reply_text = (
+                "I can show more details for a specific result, e.g. "
+                "\"details 2\" or \"the second one\", but I couldn't match that "
+                "to a listing. Try again after a search."
+            )
+        else:
+            listing = listings[int(idx) - 1]
+            _LAST_SELECTED_INDEX[session_id] = int(idx)
+            # Try to fetch full listing details by MLS so we can expose
+            # additional fields (fees, taxes, open houses, etc.).
+            mls = listing.get("mls")
+            raw = fetch_listing_by_mls(mls) if mls else None
+            if raw:
+                card = format_listing_full(listing, raw, int(idx))
+            else:
+                card = format_listing_details(listing, int(idx))
+            reply_text = f"Here are more details for listing #{idx}:\n\n{card}"
+    elif intent == "refinement":
+        if llm_result and isinstance(llm_result, dict):
+            parsed = llm_result.get("filters") or {}
+        else:
+            parsed = parse_filters(user_text)
+        state = merge_parsed_into_state(session_id, parsed, is_refinement=True)
+        reply_text = await _handle_search(ctx, sender, session_id, state)
+    else:
+        if llm_result and isinstance(llm_result, dict):
+            parsed = llm_result.get("filters") or {}
+        else:
+            parsed = parse_filters(user_text)
+        state = merge_parsed_into_state(session_id, parsed, is_refinement=False)
+        if not state.get("location") and not state.get("max_price") and not state.get("bedrooms"):
+            reply_text = (
+                "I couldn't understand the search. Try something like: "
+                "\"Find 2 bedroom homes under $600k in Austin.\""
+            )
+        else:
+            reply_text = await _handle_search(ctx, sender, session_id, state)
+
+    reply = ChatMessage(
+        content=[TextContent(type="text", text=reply_text)],
+        msg_id=uuid4(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    await ctx.send(sender, reply)
+
+
+@chat_proto.on_message(ChatAcknowledgement)
+async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    pass
+
+
+agent.include(chat_proto, publish_manifest=True)
+
+if __name__ == "__main__":
+    print("Property Finder agent address:", agent.address)
+    agent.run()

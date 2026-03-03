@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+
+# Service account / secret keys
+*.json
+
+# OS files
+.DS_Store
+
+# VS Code
+.vscode/
