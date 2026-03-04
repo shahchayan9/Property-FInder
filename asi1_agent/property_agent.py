@@ -1,7 +1,9 @@
 """
 ASI1 Property Finder agent: receives ChatMessage, parses intent, updates state,
 calls Repliers, formats response, sends ChatMessage reply.
+Optional: Payment Protocol (Stripe) to charge a small amount for full listing details.
 """
+import asyncio
 import os
 import re
 from datetime import datetime, timezone
@@ -14,6 +16,13 @@ from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
     TextContent,
     chat_protocol_spec,
+)
+from uagents_core.contrib.protocols.payment import (
+    CompletePayment,
+    Funds,
+    RequestPayment,
+    RejectPayment,
+    CommitPayment,
 )
 
 from .nl_parser import parse_filters
@@ -35,6 +44,8 @@ from property_finder.repliers_client.formatter import (
 )
 from .sheets_export import write_listings_to_sheet, create_simple_sheet, get_listings_table
 from .asi1_api import chat as asi1_chat, create_sheet_with_listings as asi1_create_sheet_with_listings
+from . import stripe_payments as stripe_payments_mod
+from .payment_proto import build_payment_proto
 
 # Load .env from asi1_agent directory so it works when run from project root
 load_dotenv(_agent_dir / ".env")
@@ -72,6 +83,8 @@ _LAST_RESULTS: dict[str, list[dict[str, Any]]] = {}
 _WISHLISTS: dict[str, list[dict[str, Any]]] = {}
 # Track the last listing index the user explicitly referenced (e.g. via 'details 2')
 _LAST_SELECTED_INDEX: dict[str, int] = {}
+# Pending Stripe payments for "details": checkout_session_id -> {sender, session_id, listing_index}
+_PENDING_DETAILS_PAYMENTS: dict[str, dict[str, Any]] = {}
 
 
 def _get_user_text(msg: ChatMessage) -> str | None:
@@ -445,11 +458,48 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                 "\"details 2\" or \"the second one\", but I couldn't match that "
                 "to a listing. Try again after a search."
             )
+        elif stripe_payments_mod.is_configured():
+            # Request a small Stripe payment to unlock full details
+            description = f"Full details for listing #{idx}"
+            checkout = await asyncio.to_thread(
+                stripe_payments_mod.create_embedded_checkout_session,
+                user_address=sender,
+                chat_session_id=session_id,
+                description=description,
+            )
+            if not checkout:
+                reply_text = "Payment setup failed. Please try again or ask for details later."
+            else:
+                sid = checkout.get("checkout_session_id") or checkout.get("id")
+                _PENDING_DETAILS_PAYMENTS[sid] = {
+                    "sender": sender,
+                    "session_id": session_id,
+                    "listing_index": int(idx),
+                }
+                amount_str = f"{stripe_payments_mod.get_amount_cents() / 100:.2f}"
+                req = RequestPayment(
+                    accepted_funds=[
+                        Funds(
+                            currency="USD",
+                            amount=amount_str,
+                            payment_method="stripe",
+                        )
+                    ],
+                    recipient=str(ctx.agent.address),
+                    deadline_seconds=300,
+                    reference=session_id,
+                    description=f"Pay ${amount_str} to unlock full details for listing #{idx}.",
+                    metadata={"stripe": checkout, "service": "listing_details"},
+                )
+                await ctx.send(sender, req)
+                reply_text = (
+                    f"Pay ${amount_str} to unlock full details for listing #{idx}. "
+                    "Complete the checkout above, then I'll send the full listing details here."
+                )
         else:
+            # No Stripe configured: show details for free
             listing = listings[int(idx) - 1]
             _LAST_SELECTED_INDEX[session_id] = int(idx)
-            # Try to fetch full listing details by MLS so we can expose
-            # additional fields (fees, taxes, open houses, etc.).
             mls = listing.get("mls")
             raw = fetch_listing_by_mls(mls) if mls else None
             if raw:
@@ -491,7 +541,71 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     pass
 
 
+async def on_payment_commit(ctx: Context, sender: str, msg: CommitPayment):
+    """Verify Stripe payment and deliver full listing details."""
+    if getattr(msg.funds, "payment_method", None) != "stripe" or not getattr(msg, "transaction_id", None):
+        await ctx.send(sender, RejectPayment(reason="Unsupported payment method (expected stripe)."))
+        return
+    tid = msg.transaction_id
+    paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, tid)
+    if not paid:
+        await ctx.send(
+            sender,
+            RejectPayment(reason="Stripe payment not completed yet. Please finish checkout."),
+        )
+        return
+    await ctx.send(sender, CompletePayment(transaction_id=tid))
+    pending = _PENDING_DETAILS_PAYMENTS.pop(tid, None)
+    if not pending:
+        await ctx.send(
+            sender,
+            ChatMessage(
+                content=[TextContent(type="text", text="Payment received, but this session expired. Run a search and request details again.")],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+        return
+    session_id = pending.get("session_id")
+    idx = pending.get("listing_index")
+    listings = _LAST_RESULTS.get(session_id) or []
+    if not idx or not (1 <= idx <= len(listings)):
+        await ctx.send(
+            sender,
+            ChatMessage(
+                content=[TextContent(type="text", text="Payment received. Your search session changed; run a search and request details again if needed.")],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+        return
+    listing = listings[idx - 1]
+    mls = listing.get("mls")
+    raw = fetch_listing_by_mls(mls) if mls else None
+    if raw:
+        card = format_listing_full(listing, raw, idx)
+    else:
+        card = format_listing_details(listing, idx)
+    reply_text = f"Here are the full details for listing #{idx}:\n\n{card}"
+    await ctx.send(
+        sender,
+        ChatMessage(
+            content=[TextContent(type="text", text=reply_text)],
+            msg_id=uuid4(),
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
+
+
+async def on_payment_reject(ctx: Context, sender: str, msg: RejectPayment):
+    """Clear any pending payment for this sender (best-effort)."""
+    to_remove = [tid for tid, p in _PENDING_DETAILS_PAYMENTS.items() if p.get("sender") == sender]
+    for tid in to_remove:
+        _PENDING_DETAILS_PAYMENTS.pop(tid, None)
+
+
 agent.include(chat_proto, publish_manifest=True)
+agent.include(build_payment_proto(on_payment_commit, on_payment_reject), publish_manifest=True)
 
 if __name__ == "__main__":
     print("Property Finder agent address:", agent.address)
