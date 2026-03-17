@@ -102,6 +102,8 @@ def merge_parsed_into_state(session_id: str, parsed: dict[str, Any], is_refineme
         updates = {k: v for k, v in parsed.items() if v is not None and k != "page"}
         if not updates:
             return get_state(session_id)
+        # Any refinement should restart pagination from page 1
+        updates["page"] = 1
         return update_state(session_id, **updates)
     # New search: use parsed as base, page=1
     return update_state(

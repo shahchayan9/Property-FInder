@@ -4,6 +4,48 @@ Format listing objects into readable ASI1 chat text.
 from typing import Any
 
 
+def _extract_urls(obj: Any, *, max_urls: int = 10) -> list[str]:
+    """
+    Best-effort extraction of URL-like strings from a nested dict/list payload.
+    This helps surface listing/virtual-tour links when the MLS feed provides them.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(v: Any):
+        if not isinstance(v, str):
+            return
+        s = v.strip()
+        if not (s.startswith("http://") or s.startswith("https://")):
+            return
+        if s in seen:
+            return
+        seen.add(s)
+        urls.append(s)
+
+    def _walk(x: Any):
+        if len(urls) >= max_urls:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                # Prefer keys that look like links
+                if isinstance(k, str) and "url" in k.lower():
+                    _add(v)
+                _walk(v)
+                if len(urls) >= max_urls:
+                    return
+        elif isinstance(x, list):
+            for it in x:
+                _walk(it)
+                if len(urls) >= max_urls:
+                    return
+        else:
+            _add(x)
+
+    _walk(obj)
+    return urls
+
+
 def format_listing(index: int, listing: dict[str, Any]) -> str:
     """Format a single listing for chat display with richer details."""
     address = listing.get("address") or "Address not available"
@@ -308,9 +350,18 @@ def format_listing_full(
     """
     card = format_listing_details(simplified, index)
     extras = _format_extra_details(raw)
+
+    # Surface any public/virtual-tour links provided by the feed
+    urls = _extract_urls(raw, max_urls=8)
+    links_block = ""
+    if urls:
+        links_block = "\n\nLinks:\n" + "\n".join(f" - {u}" for u in urls)
+    else:
+        links_block = "\n\nLinks:\n - (No public listing/virtual-tour links were provided by this MLS feed.)"
+
     if extras:
-        return card + extras
-    return card
+        return card + extras + links_block
+    return card + links_block
 
 
 def format_listings(

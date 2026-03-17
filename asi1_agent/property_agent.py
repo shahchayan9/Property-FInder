@@ -7,6 +7,7 @@ import asyncio
 import os
 import re
 from datetime import datetime, timezone
+from html import escape
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -27,7 +28,7 @@ from uagents_core.contrib.protocols.payment import (
 
 from .nl_parser import parse_filters
 from .llm_parser import llm_interpret
-from .state_manager import get_state, merge_parsed_into_state, next_page
+from .state_manager import get_state, merge_parsed_into_state, next_page, update_state
 
 # Ensure project root is on path so we can import property_finder.repliers_client
 import sys
@@ -42,8 +43,11 @@ from property_finder.repliers_client.formatter import (
     format_listing_details,
     format_listing_full,
 )
-from .sheets_export import write_listings_to_sheet, create_simple_sheet, get_listings_table
-from .asi1_api import chat as asi1_chat, create_sheet_with_listings as asi1_create_sheet_with_listings
+from .asi1_api import chat as asi1_chat
+try:
+    import resend  # type: ignore[import]
+except ImportError:  # pragma: no cover - optional email export
+    resend = None  # type: ignore[assignment]
 from . import stripe_payments as stripe_payments_mod
 from .payment_proto import build_payment_proto
 
@@ -85,6 +89,55 @@ _WISHLISTS: dict[str, list[dict[str, Any]]] = {}
 _LAST_SELECTED_INDEX: dict[str, int] = {}
 # Pending Stripe payments for "details": checkout_session_id -> {sender, session_id, listing_index}
 _PENDING_DETAILS_PAYMENTS: dict[str, dict[str, Any]] = {}
+# Also keep most recent pending payment per chat session so we can handle ASI1's
+# "<stripe:payment_id:...:CONFIRM>" chat messages (sender can change per message).
+_PENDING_DETAILS_BY_SESSION: dict[str, dict[str, Any]] = {}
+# Fallback "conversation" key when ASI1 does not provide a stable chat id and sender changes per message.
+_FALLBACK_SESSION_KEY = "asi1_chat_session"
+_WARNED_NO_CHAT_ID = False
+
+
+def _send_wishlist_email(listings: list[dict[str, Any]], to_email: str) -> bool:
+    """
+    Send a detailed email summary of wishlist listings via Resend.
+    Uses EMAIL_API_KEY from the environment. Returns True on best-effort success.
+    """
+    api_key = (os.getenv("EMAIL_API_KEY") or "").strip()
+    if not api_key or not resend:
+        return False
+    resend.api_key = api_key
+
+    # Build a detailed HTML body reusing the same formatting as the chat "details" view.
+    sections: list[str] = []
+    for idx, lst in enumerate(listings, start=1):
+        mls = lst.get("mls")
+        raw = fetch_listing_by_mls(mls) if mls else None
+        if raw:
+            text_block = format_listing_full(lst, raw, idx)
+        else:
+            text_block = format_listing_details(lst, idx)
+        # Escape for HTML and preserve newlines
+        html_block = f"<h3>Listing #{idx}</h3><pre>{escape(text_block)}</pre>"
+        sections.append(html_block)
+
+    body = (
+        "<p>Here are the listings currently in your Property Finder wishlist:</p>"
+        + "".join(sections)
+        + "<p>You can continue refining your search or request more listings inside the chat agent.</p>"
+    )
+
+    try:
+        resend.Emails.send(  # type: ignore[union-attr]
+            {
+                "from": "Property Finder <onboarding@resend.dev>",
+                "to": to_email,
+                "subject": "Your Property Finder wishlist",
+                "html": body,
+            }
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _get_user_text(msg: ChatMessage) -> str | None:
@@ -173,12 +226,36 @@ def _parse_wishlist_command(text: str) -> tuple[str, int | None] | None:
     if not text:
         return None
     t = _normalize_text(text)
+    # Normalize a few common typos so commands like "show my wishlit" still work.
+    t = (
+        t.replace("wishlit", "wishlist")
+        .replace("wihslist", "wishlist")
+        .replace("wishlst", "wishlist")
+    )
     if "wishlist" not in t and "favorite" not in t and "favourite" not in t and "saved" not in t:
         return None
+
+    # If the user mentions both "export" and "wishlist" in any order,
+    # treat it as an export request (e.g. "export my wishlist to you@example.com").
+    if "export" in t and "wishlist" in t:
+        return ("wishlist_export", None)
 
     # Clear wishlist
     if any(word in t for word in ("clear wishlist", "empty wishlist", "reset wishlist", "remove all")):
         return ("wishlist_clear", None)
+
+    # Export wishlist to a Google Sheet
+    if any(
+        phrase in t
+        for phrase in (
+            "export wishlist",
+            "wishlist sheet",
+            "wishlist excel",
+            "export my saved",
+            "export saved listings",
+        )
+    ):
+        return ("wishlist_export", None)
 
     # Add the last referenced listing if user says "add this/it to my wishlist"
     if any(
@@ -269,6 +346,18 @@ async def _handle_search(ctx: Context, sender: str, session_id: str, state: dict
     export_page_size = int(os.getenv("GOOGLE_SHEETS_EXPORT_PAGE_SIZE", "50"))
     try:
         listings, meta = search_listings(state, export_page_size=export_page_size)
+        # If the user paged ("more") past the end, roll back to the previous page and show a clearer message.
+        if not listings and int(state.get("page", 1)) > 1:
+            prev_page = max(1, int(state.get("page", 1)) - 1)
+            update_state(session_id, page=prev_page)
+            return (
+                "No more listings on the next page for your current filters.\n\n"
+                "Try:\n"
+                "- \"more\" (after broadening filters)\n"
+                "- \"under $X\" (higher)\n"
+                "- \"2 bedrooms\" (or fewer)\n"
+                "- \"only condos\""
+            )
         # Save results for follow-up "details" questions, but only if we actually got some
         if listings:
             _LAST_RESULTS[session_id] = listings
@@ -280,21 +369,6 @@ async def _handle_search(ctx: Context, sender: str, session_id: str, state: dict
             page=state.get("page", 1),
             has_more=has_more,
         )
-        # Export full list to a Google Sheet and add link:
-        # Prefer your Google service account (GOOGLE_APPLICATION_CREDENTIALS),
-        # and only fall back to ASI:One if that is not available.
-        all_listings = meta.get("all_listings") or listings
-        if all_listings:
-            summary = _search_summary(state)
-            title = f"Property Finder – {summary}"
-            headers, table_rows = get_listings_table(all_listings)
-            # First, try direct Google Sheets export via your service account
-            sheet_url = write_listings_to_sheet(all_listings, search_summary=summary)
-            # If that fails (e.g. creds missing), optionally try ASI:One helper
-            if not sheet_url:
-                sheet_url = asi1_create_sheet_with_listings(title, headers, table_rows)
-            if sheet_url:
-                reply += f"\n\n📎 Full results ({len(all_listings)} listings) have been added to a spreadsheet. Click to view: {sheet_url}"
         return reply
     except ValueError as e:
         return f"Configuration error: {e}. Please set REPLIERS_API_KEY."
@@ -305,8 +379,52 @@ async def _handle_search(ctx: Context, sender: str, session_id: str, state: dict
 @chat_proto.on_message(ChatMessage)
 async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
     """Handle incoming chat: parse intent, update state, call API, reply."""
-    # Key state by sender so the same user keeps filters across messages (ASI1 may change session per message)
-    session_id = str(sender)
+    # Key state by a stable conversation identifier if available.
+    # In ASI1 mailbox mode, `sender` can change between messages for the same human user.
+    session_id = None
+    try:
+        # ChatMessage is a pydantic model in uagents-core
+        dump = msg.model_dump() if hasattr(msg, "model_dump") else {}
+        session_id = (
+            dump.get("session_id")
+            or dump.get("session")
+            or dump.get("chat_id")
+            or dump.get("conversation_id")
+            or dump.get("thread_id")
+        )
+        if not session_id:
+            # Some deployments place identifiers in metadata
+            md = dump.get("metadata") if isinstance(dump, dict) else None
+            if isinstance(md, dict):
+                session_id = (
+                    md.get("session_id")
+                    or md.get("chat_id")
+                    or md.get("conversation_id")
+                    or md.get("thread_id")
+                )
+        if not session_id:
+            # If the message model only has (content, msg_id, timestamp), ASI1 is not giving us a stable chat id.
+            # In that case, use a single rolling session key so "more"/refine works in a live demo even if sender changes.
+            global _WARNED_NO_CHAT_ID
+            if isinstance(dump, dict) and sorted(list(dump.keys())) == ["content", "msg_id", "timestamp"]:
+                session_id = _FALLBACK_SESSION_KEY
+                if not _WARNED_NO_CHAT_ID:
+                    _WARNED_NO_CHAT_ID = True
+                    ctx.logger.warning(
+                        "No stable chat id found in ChatMessage; using fallback session key %r (sender may change per message).",
+                        _FALLBACK_SESSION_KEY,
+                    )
+            else:
+                session_id = str(sender)
+        # Emit one compact log line that helps confirm which ID is stable
+        ctx.logger.info(
+            "chat_ids sender=%s session_id=%s dump_keys=%s",
+            sender,
+            session_id,
+            sorted(list(dump.keys()))[:25],
+        )
+    except Exception:
+        session_id = str(sender)
     user_text = _get_user_text(msg)
     # ASI1 messages often start with an @agent... mention; strip it so intent detection works
     user_text = _strip_agent_mention(user_text)
@@ -317,6 +435,49 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             timestamp=datetime.now(timezone.utc),
         )
         await ctx.send(sender, reply)
+        return
+
+    # ASI1 Stripe embedded checkout can send a chat confirmation message like:
+    # "<stripe:payment_id:UUID:CONFIRM>". This is not a user search message.
+    # Handle it by verifying the most recent pending checkout for this chat session.
+    if isinstance(user_text, str) and user_text.strip().startswith("<stripe:payment_id:") and user_text.strip().endswith(":CONFIRM>"):
+        pending = _PENDING_DETAILS_BY_SESSION.get(session_id)
+        if not pending:
+            # Nothing pending; ignore quietly
+            return
+        checkout_session_id = pending.get("checkout_session_id")
+        idx = pending.get("listing_index")
+        listings = _LAST_RESULTS.get(session_id) or []
+        if not checkout_session_id or not idx or not (1 <= int(idx) <= len(listings)):
+            _PENDING_DETAILS_BY_SESSION.pop(session_id, None)
+            return
+        paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, checkout_session_id)
+        if not paid:
+            # Payment may still be processing; don't clear pending yet.
+            await ctx.send(
+                sender,
+                ChatMessage(
+                    content=[TextContent(type="text", text="Payment received signal detected, but Stripe still shows it as unpaid. Please wait a moment and try again.")],
+                    msg_id=uuid4(),
+                    timestamp=datetime.now(timezone.utc),
+                ),
+            )
+            return
+        # Deliver details
+        _PENDING_DETAILS_BY_SESSION.pop(session_id, None)
+        listing = listings[int(idx) - 1]
+        mls = listing.get("mls")
+        raw = fetch_listing_by_mls(mls) if mls else None
+        card = format_listing_full(listing, raw, int(idx)) if raw else format_listing_details(listing, int(idx))
+        reply_text = f"Here are the full details for listing #{idx}:\n\n{card}"
+        await ctx.send(
+            sender,
+            ChatMessage(
+                content=[TextContent(type="text", text=reply_text)],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
         return
 
     # Optional: send ack for long-running work
@@ -334,6 +495,17 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         current_state.get(k) is not None
         for k in ("location", "max_price", "bedrooms", "property_type", "deal_type")
     )
+    try:
+        ctx.logger.info(
+            "chat_in sender=%s session_id=%s has_state=%s text=%r state=%s",
+            sender,
+            session_id,
+            has_state,
+            user_text,
+            {k: current_state.get(k) for k in ("location", "deal_type", "bedrooms", "max_price", "property_type", "page")},
+        )
+    except Exception:
+        pass
     # First, handle wishlist commands (save/show/clear) before normal intent flow
     wishlist_cmd = _parse_wishlist_command(user_text)
     if wishlist_cmd:
@@ -358,11 +530,53 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             else:
                 listing = listings[int(idx) - 1]
                 wl = _WISHLISTS.setdefault(session_id, [])
-                wl.append(listing)
+                # Avoid duplicate entries for the same MLS in this session's wishlist
+                mls_new = listing.get("mls")
+                if any((item.get("mls") == mls_new and mls_new is not None) for item in wl):
+                    reply_text = (
+                        f"Listing #{idx} is already in your wishlist.\n\n"
+                        "Say \"show my wishlist\" to see everything you've saved in this chat."
+                    )
+                else:
+                    wl.append(listing)
+                    reply_text = (
+                        f"I've added listing #{idx} to your wishlist.\n\n"
+                        "Say \"show my wishlist\" to see everything you've saved in this chat."
+                    )
+        elif action == "wishlist_export":
+            saved = _WISHLISTS.get(session_id) or []
+            if not saved:
                 reply_text = (
-                    f"I've added listing #{idx} to your wishlist.\n\n"
-                    "Say \"show my wishlist\" to see everything you've saved in this chat."
+                    "Your wishlist is empty, so there is nothing to export.\n\n"
+                    "After a search you can save a result with \"save 1 to my wishlist\", "
+                    "then say \"export wishlist\" or \"email my wishlist to you@example.com\"."
                 )
+            else:
+                # Allow user to specify email in the message text, e.g. "export wishlist to you@example.com".
+                email_from_text = None
+                m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", user_text or "", re.IGNORECASE)
+                if m:
+                    email_from_text = m.group(1).strip()
+
+                to_email = email_from_text or (os.getenv("EMAIL_TO") or "").strip()
+                if not to_email:
+                    reply_text = (
+                        "I can email your wishlist, but I don't know where to send it.\n\n"
+                        "Either add your email to the message (e.g. `export wishlist to you@example.com`) "
+                    )
+                else:
+                    sent = _send_wishlist_email(saved, to_email)
+                    if sent:
+                        reply_text = (
+                            f"I've emailed your wishlist to {to_email}.\n\n"
+                            "You can also view your saved listings here with \"show my wishlist\"."
+                        )
+                    else:
+                        reply_text = (
+                            "I tried to email your wishlist but something went wrong.\n\n"
+                            "Check that EMAIL_API_KEY is set with a valid Resend API key and that the "
+                            "`resend` Python package is installed in the agent environment."
+                        )
         elif action == "wishlist_show":
             saved = _WISHLISTS.get(session_id) or []
             if not saved:
@@ -401,6 +615,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
 
     # Otherwise, let local logic handle explicit "more"
     intent = _detect_intent(user_text, has_state)
+    local_intent = intent
 
     # Optionally use OpenAI to interpret complex natural language into filters/intent
     llm_result = None
@@ -414,7 +629,18 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             # Let the LLM refine searches and pick details/sheet intents,
             # but do not let it override our local 'more' detection.
             if llm_intent in ("new_search", "refinement", "details", "create_sheet"):
-                intent = llm_intent
+                # Guardrail: if our local heuristic says this message is a refinement-only
+                # (e.g. "under $2300") and we have existing state, do NOT let the LLM
+                # reclassify it as a brand new search that would clear location/type.
+                if local_intent == "refinement" and llm_intent == "new_search":
+                    llm_filters = llm_result.get("filters") if isinstance(llm_result.get("filters"), dict) else {}
+                    # Only allow switching to new_search if the user actually provided a new location.
+                    if llm_filters and llm_filters.get("location"):
+                        intent = "new_search"
+                    else:
+                        intent = "refinement"
+                else:
+                    intent = llm_intent
 
     # Fallback: user said "create a google sheet" but LLM didn't return create_sheet
     if intent != "create_sheet" and _parse_create_sheet_fallback(user_text):
@@ -476,6 +702,10 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                     "session_id": session_id,
                     "listing_index": int(idx),
                 }
+                _PENDING_DETAILS_BY_SESSION[session_id] = {
+                    "checkout_session_id": sid,
+                    "listing_index": int(idx),
+                }
                 amount_str = f"{stripe_payments_mod.get_amount_cents() / 100:.2f}"
                 req = RequestPayment(
                     accepted_funds=[
@@ -513,6 +743,14 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         else:
             parsed = parse_filters(user_text)
         state = merge_parsed_into_state(session_id, parsed, is_refinement=True)
+        try:
+            ctx.logger.info(
+                "chat_refinement parsed=%s -> state=%s",
+                parsed,
+                {k: state.get(k) for k in ("location", "deal_type", "bedrooms", "max_price", "property_type", "page")},
+            )
+        except Exception:
+            pass
         reply_text = await _handle_search(ctx, sender, session_id, state)
     else:
         if llm_result and isinstance(llm_result, dict):
@@ -520,6 +758,17 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         else:
             parsed = parse_filters(user_text)
         state = merge_parsed_into_state(session_id, parsed, is_refinement=False)
+        try:
+            ctx.logger.info(
+                "chat_new_search intent=%s local_intent=%s llm_intent=%s parsed=%s -> state=%s",
+                intent,
+                local_intent,
+                (llm_result or {}).get("intent") if isinstance(llm_result, dict) else None,
+                parsed,
+                {k: state.get(k) for k in ("location", "deal_type", "bedrooms", "max_price", "property_type", "page")},
+            )
+        except Exception:
+            pass
         if not state.get("location") and not state.get("max_price") and not state.get("bedrooms"):
             reply_text = (
                 "I couldn't understand the search. Try something like: "
