@@ -43,6 +43,7 @@ from property_finder.repliers_client.formatter import (
     format_listing_details,
     format_listing_full,
 )
+# ASI:One helper is kept for optional non-search chat features
 from .asi1_api import chat as asi1_chat
 try:
     import resend  # type: ignore[import]
@@ -169,23 +170,8 @@ def _normalize_text(text: str) -> str:
 
 
 def _parse_create_sheet_fallback(text: str) -> dict | None:
-    """
-    If the message clearly asks to create a sheet (e.g. 'create a google sheet and add my name Chayan Shah'),
-    return a minimal sheet_request so we can create a sheet without LLM. Otherwise return None.
-    """
-    t = _normalize_text(text)
-    if "create" not in t or "sheet" not in t:
-        return None
-    # Try "add my name X" or "add name X" on original text to preserve casing
-    m = re.search(r"add\s+(?:my\s+)?name\s+([^.]+?)(?:\s+in\s+it|\s*$|\.)", (text or "").strip(), re.I)
-    if m:
-        name = m.group(1).strip()
-        if name:
-            return {
-                "title": f"{name} - Personal Information",
-                "rows": [["Name", name]],
-            }
-    return {"title": "Sheet from Property Finder", "rows": [["Content", (text or "").strip()[:500]]]}
+    # Google Sheets integration removed for production demo.
+    return None
 
 
 def _is_more_request(text: str) -> bool:
@@ -343,9 +329,8 @@ def _search_summary(state: dict) -> str:
 
 async def _handle_search(ctx: Context, sender: str, session_id: str, state: dict) -> str:
     """Call Repliers, format listings, optionally export to Google Sheet, return reply text."""
-    export_page_size = int(os.getenv("GOOGLE_SHEETS_EXPORT_PAGE_SIZE", "50"))
     try:
-        listings, meta = search_listings(state, export_page_size=export_page_size)
+        listings, meta = search_listings(state, export_page_size=None)
         # If the user paged ("more") past the end, roll back to the previous page and show a clearer message.
         if not listings and int(state.get("page", 1)) > 1:
             prev_page = max(1, int(state.get("page", 1)) - 1)
@@ -626,9 +611,9 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
             llm_result = None
         if llm_result and isinstance(llm_result, dict):
             llm_intent = llm_result.get("intent")
-            # Let the LLM refine searches and pick details/sheet intents,
+            # Let the LLM refine searches and pick details intents,
             # but do not let it override our local 'more' detection.
-            if llm_intent in ("new_search", "refinement", "details", "create_sheet"):
+            if llm_intent in ("new_search", "refinement", "details"):
                 # Guardrail: if our local heuristic says this message is a refinement-only
                 # (e.g. "under $2300") and we have existing state, do NOT let the LLM
                 # reclassify it as a brand new search that would clear location/type.
@@ -642,29 +627,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                 else:
                     intent = llm_intent
 
-    # Fallback: user said "create a google sheet" but LLM didn't return create_sheet
-    if intent != "create_sheet" and _parse_create_sheet_fallback(user_text):
-        intent = "create_sheet"
-        if not (isinstance(llm_result, dict) and isinstance(llm_result.get("sheet_request"), dict)):
-            llm_result = llm_result or {}
-            llm_result["sheet_request"] = _parse_create_sheet_fallback(user_text)
-
-    if intent == "create_sheet":
-        # Prefer ASI:One API so we use the platform's Google Sheets capability (like CHAI) when user is tagged to us
-        asi1_reply = asi1_chat(user_text)
-        if asi1_reply:
-            reply_text = asi1_reply
-        else:
-            sr = (llm_result or {}).get("sheet_request") if isinstance(llm_result, dict) else None
-            if sr and isinstance(sr, dict) and sr.get("title") and isinstance(sr.get("rows"), list):
-                sheet_url = create_simple_sheet(sr["title"], sr["rows"])
-                if sheet_url:
-                    reply_text = f"I've created a Google Sheet for you.\n\n📊 Title: {sr['title']}\n\n📎 Open in Google Sheets: {sheet_url}\n\nYou can add or edit content directly in the sheet."
-                else:
-                    reply_text = "I couldn't create the sheet right now (Google credentials may not be set). Try again later or ask for a property search."
-            else:
-                reply_text = "I can create a Google Sheet for you. Try something like: \"Create a Google Sheet and add my name Chayan Shah\" and I'll add that to a new sheet and share the link."
-    elif intent == "more":
+    if intent == "more":
         if not has_state:
             reply_text = (
                 "Do a search first (e.g. \"Find 2 bedroom homes under $600k in Austin\"), "

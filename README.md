@@ -100,26 +100,16 @@ You should see the agent address (e.g. `agent1q...`) and Mailbox/Almanac message
 | `REPLIERS_API_KEY` | Yes | Repliers API key for `https://api.repliers.io/listings`. |
 | `USE_MAILBOX` | No (default: true) | Use Mailbox so ASI1 can deliver messages without a public URL. |
 | `AGENT_PORT` | No (default: 8000) | Local agent port. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | No (for wishlist export) | Path to a Google **service account** JSON key file. |
-| `GOOGLE_SHEETS_EXPORT_FOLDER_ID` | No | Optional Drive folder ID; new sheets are created here (uses your quota; avoids service-account quota). |
+| `EMAIL_API_KEY` | No (for emailing wishlist) | Resend API key (`re_...`) used to send wishlist emails. |
+| `EMAIL_TO` | No | Optional default email recipient for wishlist export (users can also type an email in chat). |
 
-### Wishlist export to Google Sheets
+### Wishlist export to email
 
-For **“export wishlist”** to work:
+If `EMAIL_API_KEY` is set (Resend) the user can email their wishlist by saying:
 
-1. Create a [Google Cloud project](https://console.cloud.google.com) and a **service account**; download its JSON key.
-2. Set `GOOGLE_APPLICATION_CREDENTIALS` in `.env` to the full path of that JSON file.
-3. **Enable both** APIs for that project:
-   - [Google Sheets API](https://console.cloud.google.com/apis/library/sheets.googleapis.com)
-   - [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com)  
-   (Creating a new sheet uses the Drive API; sharing the link uses Drive as well.)
-4. Dependencies are in `requirements.txt`: `gspread`, `google-auth`, `google-api-python-client`.
+- `export wishlist to you@example.com`
 
-**If you see "Drive storage quota exceeded":** Sheets are created in the service account's Drive (very limited space). Create a folder in your own Google Drive, share it with the service account email (e.g. `test-project@your-project.iam.gserviceaccount.com`) as **Editor**, copy the folder ID from the URL (`.../folders/FOLDER_ID`), and set in `.env`:  
-`GOOGLE_SHEETS_EXPORT_FOLDER_ID=FOLDER_ID`  
-New exports will then use your Drive quota.
-
-If export fails for other reasons, check the **agent terminal** for the exact error (e.g. 403 = API not enabled).
+If `EMAIL_TO` is set, users can also say just `export wishlist` and it will use the default recipient.
 
 ## Which cities/searches work?
 
