@@ -19,7 +19,8 @@ _project_root = _dir.parent                # Property-FInder/
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-# Load shared .env (same file used by Property-FInder agent)
+# Load .env — check project root first, then asi1_agent/ as fallback
+load_dotenv(_project_root / ".env")
 load_dotenv(_project_root / "asi1_agent" / ".env")
 
 from real_estate_agent.report_models import ReportRequest, ReportResponse
@@ -36,12 +37,13 @@ if not agent_seed:
     )
 
 agent_port = int(os.getenv("RE_AGENT_PORT", "8001"))
-use_mailbox = os.getenv("USE_MAILBOX", "true").lower() == "true"
+use_mailbox = os.getenv("USE_MAILBOX", os.getenv("AGENT_MAILBOX", "true")).lower() == "true"
 
 _agent_kwargs: dict = {
     "name": "Real Estate Report Agent",
     "seed": agent_seed,
     "port": agent_port,
+    "network": "testnet",
 }
 if use_mailbox:
     _agent_kwargs["mailbox"] = True

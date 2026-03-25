@@ -40,8 +40,8 @@ for _p in (_property_finder_dir, _project_root):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from property_finder.repliers_client.client import search_listings, fetch_listing_by_mls
-from property_finder.repliers_client.formatter import (
+from repliers_client.client import search_listings, fetch_listing_by_mls
+from repliers_client.formatter import (
     format_listings as format_listings_text,
     format_listing_details,
     format_listing_full,
@@ -56,7 +56,8 @@ except ImportError:  # pragma: no cover - optional email export
 from . import stripe_payments as stripe_payments_mod
 from .payment_proto import build_payment_proto
 
-# Load .env from asi1_agent directory so it works when run from project root
+# Load .env — project root first, then asi1_agent/ as fallback
+load_dotenv(_property_finder_dir / ".env")
 load_dotenv(_agent_dir / ".env")
 
 # --- Agent setup (ASI1 compatible) ---
@@ -65,13 +66,14 @@ if not agent_seed:
     raise ValueError("AGENT_SECRET_KEY_1 not set in .env")
 
 agent_port = int(os.getenv("AGENT_PORT", "8000"))
-use_mailbox = os.getenv("USE_MAILBOX", "true").lower() == "true"
+use_mailbox = os.getenv("USE_MAILBOX", os.getenv("AGENT_MAILBOX", "true")).lower() == "true"
 agent_endpoint = os.getenv("AGENT_ENDPOINT_URL")
 
 agent_kwargs = {
     "name": "Property Finder",
     "seed": agent_seed,
     "port": agent_port,
+    "network": "testnet",
 }
 if use_mailbox:
     agent_kwargs["mailbox"] = True

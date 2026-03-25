@@ -52,5 +52,8 @@ def send_report_email(to_email: str, sheet_url: str, count: int, location: str) 
             "html": html_body,
         })
         return True
-    except Exception:
+    except Exception as exc:
+        import traceback
+        print(f"[report_email] ERROR sending email: {exc}")
+        traceback.print_exc()
         return False
