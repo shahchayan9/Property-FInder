@@ -94,25 +94,27 @@ def format_listing(index: int, listing: dict[str, Any]) -> str:
     if neighborhood:
         neighborhood_line = f"\n   Neighborhood: {neighborhood}"
 
-    # Image line (show multiple photo URLs when we have them; API can return many per listing)
+    # Image line (render markdown image embeds so ASI1 can show inline images)
     image_line = ""
     if isinstance(images, list) and images:
-        # Show up to 3 photo links in the main card so users can click through; "details N" has the rest
+        # Show up to 3 images in the main card; "details N" has the rest
         show = images[:3]
-        photo_lines = [f"   Photo {i + 1}: {url}" for i, url in enumerate(show)]
+        photo_lines = [f"   Photo {i + 1}:\n   ![Listing {index} Photo {i + 1}]({url})" for i, url in enumerate(show)]
         image_line = "\n" + "\n".join(photo_lines)
         if len(images) > 3:
             image_line += f"\n   (+{len(images) - 3} more — say \"details {index}\" for all)"
     elif image_url:
-        image_line = f"\n   Photo: {image_url}"
+        image_line = f"\n   Photo:\n   ![Listing {index} Photo]({image_url})"
 
     return (
-        f"{index}. {address} – {price_str}\n"
-        f"   {detail_line}"
+        f"### Listing {index}\n"
+        f"**{address}**\n"
+        f"**Price:** {price_str}\n"
+        f"**Specs:** {detail_line}"
         f"{desc_snippet}"
         f"{neighborhood_line}"
         f"{image_line}\n"
-        f"   MLS: {mls}"
+        f"**MLS:** `{mls}`"
     )
 
 
@@ -121,15 +123,21 @@ def format_listing_details(listing: dict[str, Any], index: int | None = None) ->
     More verbose detail view for a single listing.
     Shows all key specs and multiple photos.
     """
-    # Reuse summary line
-    header = format_listing(index or 1, listing)
+    # Reuse summary card and add a details heading
+    header = f"## Full Details\n\n{format_listing(index or 1, listing)}"
 
     # Additional photos (main card shows first 3; here show the rest)
     images = listing.get("images") or []
     photos_block = ""
     if isinstance(images, list) and len(images) > 3:
         extra = images[3:]
-        photos_block = "\n   More photos:\n" + "\n".join(f"   - {url}" for url in extra)
+        photos_block = (
+            "\n\n**More photos:**\n"
+            + "\n\n".join(
+                f"   Photo {i + 4}:\n   ![Listing {index or 1} Photo {i + 4}]({url})"
+                for i, url in enumerate(extra)
+            )
+        )
 
     # For now we don't have reviews data from MLS, so we omit that section.
     return header + photos_block
@@ -196,7 +204,7 @@ def _format_extra_details(raw: dict[str, Any]) -> str:
     if occup:
         lifecycle_lines.append(f"Occupancy: {occup}")
     if lifecycle_lines:
-        parts.append("Status & history:")
+        parts.append("### Status & history")
         parts.append("  " + "\n  ".join(lifecycle_lines))
 
     # Property details
@@ -234,7 +242,7 @@ def _format_extra_details(raw: dict[str, Any]) -> str:
         detail_lines.append(f"Sewer: {sewer}")
 
     if detail_lines:
-        parts.append("\nProperty details:")
+        parts.append("\n### Property details")
         parts.append("  " + "\n  ".join(detail_lines))
 
     # Lot
@@ -249,7 +257,7 @@ def _format_extra_details(raw: dict[str, Any]) -> str:
     if lot_desc:
         lot_lines.append(f"Lot details: {lot_desc}")
     if lot_lines:
-        parts.append("\nLot:")
+        parts.append("\n### Lot")
         parts.append("  " + "\n  ".join(lot_lines))
 
     # Taxes
@@ -261,14 +269,14 @@ def _format_extra_details(raw: dict[str, Any]) -> str:
     if tax_year:
         tax_lines.append(f"Tax assessment year: {tax_year}")
     if tax_lines:
-        parts.append("\nTaxes:")
+        parts.append("\n### Taxes")
         parts.append("  " + "\n  ".join(tax_lines))
 
     # Nearby amenities
     amenities = nearby.get("amenities") or []
     if isinstance(amenities, list) and amenities:
         top_amenities = amenities[:6]
-        parts.append("\nNearby amenities:")
+        parts.append("\n### Nearby amenities")
         parts.append("  " + ", ".join(str(a) for a in top_amenities))
 
     # Open houses
@@ -292,7 +300,7 @@ def _format_extra_details(raw: dict[str, Any]) -> str:
             if pieces:
                 lines.append(" - " + " ".join(pieces))
         if lines:
-            parts.append("\nOpen houses:")
+            parts.append("\n### Open houses")
             parts.extend(lines)
 
     # Condo-specific (fees & parking)
@@ -330,7 +338,7 @@ def _format_extra_details(raw: dict[str, Any]) -> str:
         condo_lines.append(f"Pets: {pets}")
 
     if condo_lines:
-        parts.append("\nCondo:")
+        parts.append("\n### Condo")
         parts.append("  " + "\n  ".join(condo_lines))
 
     if not parts:
@@ -355,9 +363,9 @@ def format_listing_full(
     urls = _extract_urls(raw, max_urls=8)
     links_block = ""
     if urls:
-        links_block = "\n\nLinks:\n" + "\n".join(f" - {u}" for u in urls)
+        links_block = "\n\n### Links\n" + "\n".join(f"- [Open link {i + 1}]({u})" for i, u in enumerate(urls))
     else:
-        links_block = "\n\nLinks:\n - (No public listing/virtual-tour links were provided by this MLS feed.)"
+        links_block = "\n\n### Links\n- (No public listing/virtual-tour links were provided by this MLS feed.)"
 
     if extras:
         return card + extras + links_block
@@ -377,24 +385,30 @@ def format_listings(
     """
     if not listings:
         return (
-            "No listings found for your criteria. "
-            "Try broadening the search (e.g. higher price, different area, or fewer bedrooms). "
-            "Some cities may not be in our current MLS coverage—if you tried a specific city, try a nearby area or a state that your MLS includes (e.g. Austin, TX)."
+            "## No matches yet\n\n"
+            "I could not find listings for those filters.\n\n"
+            "**Try this next:**\n"
+            "- Increase max price (e.g. `under $2600`)\n"
+            "- Reduce bedroom requirement (e.g. `2 bedrooms`)\n"
+            "- Switch area (e.g. `in Austin`)\n"
+            "- Change type (e.g. `only condos`)\n\n"
+            "_Note: some cities may not be included in your MLS coverage._"
         )
 
     parts = []
     if location or max_price is not None:
-        desc = "Here are "
+        desc = "## Property matches\n\n"
+        scope_parts: list[str] = []
         if location:
-            desc += f"properties in {location}"
-        else:
-            desc += "properties"
+            scope_parts.append(f"in **{location}**")
         if max_price is not None:
-            desc += f" under ${max_price:,}"
-        desc += ":\n\n"
+            scope_parts.append(f"under **${max_price:,}**")
+        if scope_parts:
+            desc += f"Showing results {' '.join(scope_parts)}.\n\n"
+        desc += f"**Page:** {max(1, int(page))}\n\n"
         parts.append(desc)
     else:
-        parts.append("Here are the listings:\n\n")
+        parts.append(f"## Property matches\n\n**Page:** {max(1, int(page))}\n\n")
 
     for i, listing in enumerate(listings, 1):
         parts.append(format_listing(i, listing))
@@ -403,15 +417,17 @@ def format_listings(
     text = "".join(parts).strip()
     text += "\n\n"
     text += (
-        "Reply with:\n"
-        "- \"more\" to see more listings\n"
-        "- \"refine under $X\" or \"under $X\" to change max price\n"
-        "- \"X bedrooms\" or \"change to X bedrooms\" to change beds\n"
-        "- \"only condos\" (or \"condos only\") to filter by property type\n"
-        "- \"details N\" (e.g. \"details 2\") to see full details and photos for a result\n"
-        "- \"save N to my wishlist\" (e.g. \"save 1 to my wishlist\" or \"add the second one to favorites\") to save a result\n"
-        "- \"show my wishlist\" to see everything you've saved in this chat"
+        "## Quick actions\n"
+        "- `more` -> next page\n"
+        "- `under $X` -> update budget\n"
+        "- `X bedrooms` -> change bedrooms\n"
+        "- `only condos` -> filter property type\n"
+        "- `details N` -> full photos + extra details\n"
+        "- `save N to my wishlist` -> save a listing\n"
+        "- `show my wishlist` -> view saved listings\n"
     )
     if has_more:
-        text += "\n(There are more results on the next page.)"
+        text += "\n**More available:** yes (say `more`)"
+    else:
+        text += "\n**More available:** no (refine filters for new matches)"
     return text
