@@ -30,19 +30,23 @@ from .nl_parser import parse_filters
 from .llm_parser import llm_interpret
 from .state_manager import get_state, merge_parsed_into_state, next_page, update_state
 
-# Ensure project root is on path so we can import property_finder.repliers_client
+# Ensure project root is on path so we can import repliers_client and real_estate_agent
 import sys
 from pathlib import Path
 _agent_dir = Path(__file__).resolve().parent
-_project_root = _agent_dir.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-from property_finder.repliers_client.client import search_listings, fetch_listing_by_mls
-from property_finder.repliers_client.formatter import (
+_property_finder_dir = _agent_dir.parent   # Property-FInder/
+_project_root = _agent_dir.parent.parent   # fetch labs/ (for property_finder.* imports)
+for _p in (_property_finder_dir, _project_root):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from repliers_client.client import search_listings, fetch_listing_by_mls
+from repliers_client.formatter import (
     format_listings as format_listings_text,
     format_listing_details,
     format_listing_full,
 )
+from real_estate_agent.report_models import ReportRequest, ReportResponse
 # ASI:One helper is kept for optional non-search chat features
 from .asi1_api import chat as asi1_chat
 try:
@@ -52,7 +56,8 @@ except ImportError:  # pragma: no cover - optional email export
 from . import stripe_payments as stripe_payments_mod
 from .payment_proto import build_payment_proto
 
-# Load .env from asi1_agent directory so it works when run from project root
+# Load .env — project root first, then asi1_agent/ as fallback
+load_dotenv(_property_finder_dir / ".env")
 load_dotenv(_agent_dir / ".env")
 
 # --- Agent setup (ASI1 compatible) ---
@@ -61,13 +66,14 @@ if not agent_seed:
     raise ValueError("AGENT_SECRET_KEY_1 not set in .env")
 
 agent_port = int(os.getenv("AGENT_PORT", "8000"))
-use_mailbox = os.getenv("USE_MAILBOX", "true").lower() == "true"
+use_mailbox = os.getenv("USE_MAILBOX", os.getenv("AGENT_MAILBOX", "true")).lower() == "true"
 agent_endpoint = os.getenv("AGENT_ENDPOINT_URL")
 
 agent_kwargs = {
     "name": "Property Finder",
     "seed": agent_seed,
     "port": agent_port,
+    "network": "testnet",
 }
 if use_mailbox:
     agent_kwargs["mailbox"] = True
@@ -96,6 +102,16 @@ _PENDING_DETAILS_BY_SESSION: dict[str, dict[str, Any]] = {}
 # Fallback "conversation" key when ASI1 does not provide a stable chat id and sender changes per message.
 _FALLBACK_SESSION_KEY = "asi1_chat_session"
 _WARNED_NO_CHAT_ID = False
+
+# ── Full-report integration (Property-FInder → Real Estate Report Agent) ─────
+# Pending Stripe payments for full reports: checkout_session_id -> {sender, session_id, filters, email}
+_PENDING_REPORT_PAYMENTS: dict[str, dict[str, Any]] = {}
+# Same info keyed by session_id (for Stripe chat-confirm message routing)
+_PENDING_REPORTS_BY_SESSION: dict[str, dict[str, Any]] = {}
+# Sessions awaiting an email address before triggering a report
+_PENDING_EMAIL_REQUESTS: dict[str, dict[str, Any]] = {}
+# Maps session_id → original chat sender so ReportResponse can be delivered
+_REPORT_REPLY_TARGETS: dict[str, str] = {}
 
 
 def _send_wishlist_email(listings: list[dict[str, Any]], to_email: str) -> bool:
@@ -139,6 +155,112 @@ def _send_wishlist_email(listings: list[dict[str, Any]], to_email: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _get_real_estate_agent_address() -> str | None:
+    """Return the Real Estate Report Agent address from env, or None if not configured."""
+    return (os.getenv("REAL_ESTATE_AGENT_ADDRESS") or "").strip() or None
+
+
+def _is_full_report_request(text: str) -> bool:
+    """True if the user is asking for a full property report / spreadsheet export."""
+    t = _normalize_text(text)
+    report_phrases = (
+        "full report",
+        "full listing",
+        "all listings",
+        "all properties",
+        "spreadsheet",
+        "google sheet",
+        "deep analysis",
+        "detailed report",
+        "export all",
+        "send me all",
+        "send me a report",
+        "send a report",
+        "send report",
+        "email me all",
+        "email report",
+        "email the list",
+        "email all",
+        "full data",
+        "complete list",
+    )
+    return any(phrase in t for phrase in report_phrases)
+
+
+def _extract_email_from_text(text: str) -> str | None:
+    """Extract the first email address found in text, or None."""
+    m = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", text or "", re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+async def _trigger_report(
+    ctx: Context,
+    sender: str,
+    session_id: str,
+    filters: dict,
+    email: str,
+) -> str:
+    """
+    Gate the full report with Stripe (if configured), then send ReportRequest
+    to the Real Estate Report Agent. Returns the reply text for the user.
+    """
+    re_addr = _get_real_estate_agent_address()
+    if not re_addr:
+        return (
+            "Full report service is not configured. "
+            "Ask the admin to set REAL_ESTATE_AGENT_ADDRESS in .env."
+        )
+
+    _REPORT_REPLY_TARGETS[session_id] = sender
+
+    if stripe_payments_mod.is_configured():
+        location = filters.get("location", "your area")
+        description = f"Full property report — all listings in {location}"
+        checkout = await asyncio.to_thread(
+            stripe_payments_mod.create_hosted_checkout_session,
+            user_address=sender,
+            chat_session_id=session_id,
+            description=description,
+            service="full_report",
+        )
+        if not checkout:
+            _REPORT_REPLY_TARGETS.pop(session_id, None)
+            return "Payment setup failed. Please try again."
+
+        sid = checkout.get("checkout_session_id") or checkout.get("id")
+        pending_info = {
+            "sender": sender,
+            "session_id": session_id,
+            "filters": dict(filters),
+            "email": email,
+        }
+        _PENDING_REPORT_PAYMENTS[sid] = pending_info
+        _PENDING_REPORTS_BY_SESSION[session_id] = {**pending_info, "checkout_session_id": sid}
+
+        amount_str = f"{stripe_payments_mod.get_amount_cents() / 100:.2f}"
+        pay_url = checkout.get("checkout_url", "")
+        return (
+            f"To generate your full property report for {location}, a payment of ${amount_str} is required.\n\n"
+            f"Pay here: {pay_url}\n\n"
+            f"I'll automatically detect the payment and email all listings to {email} right away."
+        )
+    else:
+        # No Stripe — send report directly
+        await ctx.send(
+            re_addr,
+            ReportRequest(
+                session_id=session_id,
+                filters=dict(filters),
+                user_email=email,
+            ),
+        )
+        location = filters.get("location", "your area")
+        return (
+            f"Generating your full property report for {location}...\n"
+            f"I'll email it to {email} shortly."
+        )
 
 
 def _get_user_text(msg: ChatMessage) -> str | None:
@@ -422,10 +544,146 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         await ctx.send(sender, reply)
         return
 
+    # ── Hosted Stripe payment confirmation ("report ready" / "details ready") ──────────────────
+    # After the user pays on Stripe's hosted page they return here and say "report ready" etc.
+    # We poll Stripe to verify payment, then deliver the content.
+    _t_lower = (user_text or "").strip().lower()
+    _report_confirm_phrases = ("report ready", "paid", "i paid", "i've paid", "ive paid", "payment done", "payment complete", "done paying", "i completed payment")
+    _details_confirm_phrases = ("details ready", "paid", "i paid", "i've paid", "ive paid", "payment done", "payment complete", "done paying", "i completed payment")
+
+    # Check for pending full-report payment that has been paid
+    if any(p in _t_lower for p in _report_confirm_phrases):
+        report_pending = _PENDING_REPORTS_BY_SESSION.get(session_id)
+        if report_pending:
+            checkout_session_id = report_pending.get("checkout_session_id")
+            paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, checkout_session_id)
+            if paid:
+                _PENDING_REPORTS_BY_SESSION.pop(session_id, None)
+                _PENDING_REPORT_PAYMENTS.pop(checkout_session_id, None)
+                re_addr = _get_real_estate_agent_address()
+                if re_addr:
+                    _REPORT_REPLY_TARGETS[session_id] = sender
+                    await ctx.send(
+                        re_addr,
+                        ReportRequest(
+                            session_id=session_id,
+                            filters=report_pending["filters"],
+                            user_email=report_pending["email"],
+                        ),
+                    )
+                    reply_text = (
+                        f"Payment confirmed! Generating your full property report...\n"
+                        f"I'll email it to {report_pending['email']} shortly."
+                    )
+                else:
+                    reply_text = "Payment confirmed but the report service is unavailable. Contact support."
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        content=[TextContent(type="text", text=reply_text)],
+                        msg_id=uuid4(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                )
+                return
+            elif report_pending:
+                # Payment pending — let user know
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        content=[TextContent(type="text", text="Payment not confirmed yet on Stripe. Please complete checkout and try again.")],
+                        msg_id=uuid4(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                )
+                return
+
+    # Check for pending details payment that has been paid
+    if any(p in _t_lower for p in _details_confirm_phrases):
+        details_pending = _PENDING_DETAILS_BY_SESSION.get(session_id)
+        if details_pending:
+            checkout_session_id = details_pending.get("checkout_session_id")
+            idx = details_pending.get("listing_index")
+            listings = _LAST_RESULTS.get(session_id) or []
+            paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, checkout_session_id)
+            if paid and idx and (1 <= int(idx) <= len(listings)):
+                _PENDING_DETAILS_BY_SESSION.pop(session_id, None)
+                _PENDING_DETAILS_PAYMENTS.pop(checkout_session_id, None)
+                listing = listings[int(idx) - 1]
+                _LAST_SELECTED_INDEX[session_id] = int(idx)
+                mls = listing.get("mls")
+                raw = fetch_listing_by_mls(mls) if mls else None
+                card = format_listing_full(listing, raw, int(idx)) if raw else format_listing_details(listing, int(idx))
+                reply_text = f"Payment confirmed! Here are the full details for listing #{idx}:\n\n{card}"
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        content=[TextContent(type="text", text=reply_text)],
+                        msg_id=uuid4(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                )
+                return
+            elif details_pending:
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        content=[TextContent(type="text", text="Payment not confirmed yet on Stripe. Please complete checkout and try again.")],
+                        msg_id=uuid4(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                )
+                return
+
     # ASI1 Stripe embedded checkout can send a chat confirmation message like:
     # "<stripe:payment_id:UUID:CONFIRM>". This is not a user search message.
     # Handle it by verifying the most recent pending checkout for this chat session.
     if isinstance(user_text, str) and user_text.strip().startswith("<stripe:payment_id:") and user_text.strip().endswith(":CONFIRM>"):
+        # ── Check if this is a pending full-report payment ──────────────────
+        report_pending = _PENDING_REPORTS_BY_SESSION.get(session_id)
+        if report_pending:
+            checkout_session_id = report_pending.get("checkout_session_id")
+            paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, checkout_session_id)
+            if not paid:
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        content=[TextContent(type="text", text="Payment received signal detected, but Stripe still shows it as unpaid. Please wait a moment and try again.")],
+                        msg_id=uuid4(),
+                        timestamp=datetime.now(timezone.utc),
+                    ),
+                )
+                return
+            _PENDING_REPORTS_BY_SESSION.pop(session_id, None)
+            _PENDING_REPORT_PAYMENTS.pop(checkout_session_id, None)
+            re_addr = _get_real_estate_agent_address()
+            if re_addr:
+                _REPORT_REPLY_TARGETS[session_id] = sender
+                await ctx.send(
+                    re_addr,
+                    ReportRequest(
+                        session_id=session_id,
+                        filters=report_pending["filters"],
+                        user_email=report_pending["email"],
+                    ),
+                )
+                reply_text = (
+                    f"Payment confirmed! Generating your full property report...\n"
+                    f"I'll email it to {report_pending['email']} shortly."
+                )
+            else:
+                reply_text = "Payment confirmed but the report service is unavailable. Contact support."
+            await ctx.send(
+                sender,
+                ChatMessage(
+                    content=[TextContent(type="text", text=reply_text)],
+                    msg_id=uuid4(),
+                    timestamp=datetime.now(timezone.utc),
+                ),
+            )
+            return
+
+        # ── Check if this is a pending listing-details payment ──────────────
         pending = _PENDING_DETAILS_BY_SESSION.get(session_id)
         if not pending:
             # Nothing pending; ignore quietly
@@ -491,6 +749,58 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         )
     except Exception:
         pass
+
+    # ── Pending email for full report ────────────────────────────────────────
+    # If we previously asked "what email should I send it to?", the next message is the email.
+    if session_id in _PENDING_EMAIL_REQUESTS:
+        email_from_text = _extract_email_from_text(user_text)
+        if email_from_text:
+            pending_info = _PENDING_EMAIL_REQUESTS.pop(session_id)
+            reply_text = await _trigger_report(
+                ctx, sender, session_id, pending_info["filters"], email_from_text
+            )
+            await ctx.send(
+                sender,
+                ChatMessage(
+                    content=[TextContent(type="text", text=reply_text)],
+                    msg_id=uuid4(),
+                    timestamp=datetime.now(timezone.utc),
+                ),
+            )
+            return
+        # If it doesn't look like an email yet, fall through to normal handling
+        # (the user may have changed their mind or said something else)
+        _PENDING_EMAIL_REQUESTS.pop(session_id, None)
+
+    # ── Full report intent ───────────────────────────────────────────────────
+    if _is_full_report_request(user_text) and _get_real_estate_agent_address():
+        if not has_state:
+            reply_text = (
+                "Do a property search first (e.g. \"Find 3-bedroom homes under $700k in Austin\"), "
+                "then say \"full report\" or \"email me all listings\" to get a complete spreadsheet."
+            )
+        else:
+            email = _extract_email_from_text(user_text) or (os.getenv("EMAIL_TO") or "").strip()
+            if not email:
+                _PENDING_EMAIL_REQUESTS[session_id] = {"filters": dict(current_state)}
+                reply_text = (
+                    "I'll prepare a full report with all matching listings in a Google Sheet. "
+                    "What email address should I send it to?"
+                )
+            else:
+                reply_text = await _trigger_report(
+                    ctx, sender, session_id, current_state, email
+                )
+        await ctx.send(
+            sender,
+            ChatMessage(
+                content=[TextContent(type="text", text=reply_text)],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+        return
+
     # First, handle wishlist commands (save/show/clear) before normal intent flow
     wishlist_cmd = _parse_wishlist_command(user_text)
     if wishlist_cmd:
@@ -648,13 +958,14 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                 "to a listing. Try again after a search."
             )
         elif stripe_payments_mod.is_configured():
-            # Request a small Stripe payment to unlock full details
+            # Gate full listing details behind a small Stripe payment (hosted checkout)
             description = f"Full details for listing #{idx}"
             checkout = await asyncio.to_thread(
-                stripe_payments_mod.create_embedded_checkout_session,
+                stripe_payments_mod.create_hosted_checkout_session,
                 user_address=sender,
                 chat_session_id=session_id,
                 description=description,
+                service="listing_details",
             )
             if not checkout:
                 reply_text = "Payment setup failed. Please try again or ask for details later."
@@ -670,24 +981,11 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                     "listing_index": int(idx),
                 }
                 amount_str = f"{stripe_payments_mod.get_amount_cents() / 100:.2f}"
-                req = RequestPayment(
-                    accepted_funds=[
-                        Funds(
-                            currency="USD",
-                            amount=amount_str,
-                            payment_method="stripe",
-                        )
-                    ],
-                    recipient=str(ctx.agent.address),
-                    deadline_seconds=300,
-                    reference=session_id,
-                    description=f"Pay ${amount_str} to unlock full details for listing #{idx}.",
-                    metadata={"stripe": checkout, "service": "listing_details"},
-                )
-                await ctx.send(sender, req)
+                pay_url = checkout.get("checkout_url", "")
                 reply_text = (
-                    f"Pay ${amount_str} to unlock full details for listing #{idx}. "
-                    "Complete the checkout above, then I'll send the full listing details here."
+                    f"To unlock full details for listing #{idx}, a payment of ${amount_str} is required.\n\n"
+                    f"Pay here: {pay_url}\n\n"
+                    "I'll automatically detect the payment and send the full listing details right away."
                 )
         else:
             # No Stripe configured: show details for free
@@ -754,7 +1052,7 @@ async def on_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 
 
 async def on_payment_commit(ctx: Context, sender: str, msg: CommitPayment):
-    """Verify Stripe payment and deliver full listing details."""
+    """Verify Stripe payment and deliver full listing details or trigger report."""
     if getattr(msg.funds, "payment_method", None) != "stripe" or not getattr(msg, "transaction_id", None):
         await ctx.send(sender, RejectPayment(reason="Unsupported payment method (expected stripe)."))
         return
@@ -767,6 +1065,41 @@ async def on_payment_commit(ctx: Context, sender: str, msg: CommitPayment):
         )
         return
     await ctx.send(sender, CompletePayment(transaction_id=tid))
+
+    # ── Check if this is a report payment ────────────────────────────────────
+    report_pending = _PENDING_REPORT_PAYMENTS.pop(tid, None)
+    if report_pending:
+        _PENDING_REPORTS_BY_SESSION.pop(report_pending.get("session_id", ""), None)
+        re_addr = _get_real_estate_agent_address()
+        original_sender = report_pending.get("sender", sender)
+        session_id = report_pending.get("session_id", "")
+        if re_addr and session_id:
+            _REPORT_REPLY_TARGETS[session_id] = original_sender
+            await ctx.send(
+                re_addr,
+                ReportRequest(
+                    session_id=session_id,
+                    filters=report_pending["filters"],
+                    user_email=report_pending["email"],
+                ),
+            )
+            reply_text = (
+                f"Payment confirmed! Generating your full property report...\n"
+                f"I'll email it to {report_pending['email']} shortly."
+            )
+        else:
+            reply_text = "Payment confirmed but the report service is unavailable. Contact support."
+        await ctx.send(
+            original_sender,
+            ChatMessage(
+                content=[TextContent(type="text", text=reply_text)],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+        return
+
+    # ── Otherwise it's a listing-details payment ──────────────────────────────
     pending = _PENDING_DETAILS_PAYMENTS.pop(tid, None)
     if not pending:
         await ctx.send(
@@ -814,6 +1147,110 @@ async def on_payment_reject(ctx: Context, sender: str, msg: RejectPayment):
     to_remove = [tid for tid, p in _PENDING_DETAILS_PAYMENTS.items() if p.get("sender") == sender]
     for tid in to_remove:
         _PENDING_DETAILS_PAYMENTS.pop(tid, None)
+    # Also clean up any pending report payments from this sender
+    report_remove = [tid for tid, p in _PENDING_REPORT_PAYMENTS.items() if p.get("sender") == sender]
+    for tid in report_remove:
+        rp = _PENDING_REPORT_PAYMENTS.pop(tid, None)
+        if rp:
+            _PENDING_REPORTS_BY_SESSION.pop(rp.get("session_id", ""), None)
+
+
+@agent.on_interval(period=8.0)
+async def poll_stripe_payments(ctx: Context):
+    """
+    Every 8 seconds, check all pending Stripe sessions.
+    Auto-triggers reports / delivers details as soon as payment is confirmed —
+    no need for the user to say 'report ready'.
+    """
+    # ── Full-report payments ──────────────────────────────────────────────────
+    for session_id, report_pending in list(_PENDING_REPORTS_BY_SESSION.items()):
+        checkout_session_id = report_pending.get("checkout_session_id")
+        if not checkout_session_id:
+            continue
+        paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, checkout_session_id)
+        if not paid:
+            continue
+        _PENDING_REPORTS_BY_SESSION.pop(session_id, None)
+        _PENDING_REPORT_PAYMENTS.pop(checkout_session_id, None)
+        re_addr = _get_real_estate_agent_address()
+        original_sender = report_pending.get("sender") or _REPORT_REPLY_TARGETS.get(session_id)
+        if not re_addr or not original_sender:
+            continue
+        _REPORT_REPLY_TARGETS[session_id] = original_sender
+        await ctx.send(
+            re_addr,
+            ReportRequest(
+                session_id=session_id,
+                filters=report_pending["filters"],
+                user_email=report_pending["email"],
+            ),
+        )
+        await ctx.send(
+            original_sender,
+            ChatMessage(
+                content=[TextContent(
+                    type="text",
+                    text=(
+                        f"Payment confirmed! Generating your full property report...\n"
+                        f"I'll email it to {report_pending['email']} shortly."
+                    ),
+                )],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+
+    # ── Listing-details payments ──────────────────────────────────────────────
+    for session_id, details_pending in list(_PENDING_DETAILS_BY_SESSION.items()):
+        checkout_session_id = details_pending.get("checkout_session_id")
+        idx = details_pending.get("listing_index")
+        listings = _LAST_RESULTS.get(session_id) or []
+        if not checkout_session_id or not idx or not (1 <= int(idx) <= len(listings)):
+            continue
+        paid = await asyncio.to_thread(stripe_payments_mod.verify_checkout_session_paid, checkout_session_id)
+        if not paid:
+            continue
+        _PENDING_DETAILS_BY_SESSION.pop(session_id, None)
+        _PENDING_DETAILS_PAYMENTS.pop(checkout_session_id, None)
+        original_sender = details_pending.get("sender")
+        if not original_sender:
+            continue
+        listing = listings[int(idx) - 1]
+        _LAST_SELECTED_INDEX[session_id] = int(idx)
+        mls = listing.get("mls")
+        raw = fetch_listing_by_mls(mls) if mls else None
+        card = format_listing_full(listing, raw, int(idx)) if raw else format_listing_details(listing, int(idx))
+        await ctx.send(
+            original_sender,
+            ChatMessage(
+                content=[TextContent(
+                    type="text",
+                    text=f"Payment confirmed! Here are the full details for listing #{idx}:\n\n{card}",
+                )],
+                msg_id=uuid4(),
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+
+
+@agent.on_message(ReportResponse)
+async def on_report_response(ctx: Context, sender: str, msg: ReportResponse):
+    """
+    Receive the result from the Real Estate Report Agent and relay it to the user.
+    The report agent sends this after creating the Google Sheet and emailing the user.
+    """
+    original_sender = _REPORT_REPLY_TARGETS.pop(msg.session_id, None)
+    if not original_sender:
+        ctx.logger.warning("ReportResponse for unknown session %s (no reply target)", msg.session_id)
+        return
+    await ctx.send(
+        original_sender,
+        ChatMessage(
+            content=[TextContent(type="text", text=msg.message)],
+            msg_id=uuid4(),
+            timestamp=datetime.now(timezone.utc),
+        ),
+    )
 
 
 agent.include(chat_proto, publish_manifest=True)
