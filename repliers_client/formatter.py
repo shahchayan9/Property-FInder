@@ -94,17 +94,17 @@ def format_listing(index: int, listing: dict[str, Any]) -> str:
     if neighborhood:
         neighborhood_line = f"\n   Neighborhood: {neighborhood}"
 
-    # Image line (show multiple photo URLs when we have them; API can return many per listing)
+    # Image line (render markdown image embeds so ASI1 can show inline images)
     image_line = ""
     if isinstance(images, list) and images:
-        # Show up to 3 photo links in the main card so users can click through; "details N" has the rest
+        # Show up to 3 images in the main card; "details N" has the rest
         show = images[:3]
-        photo_lines = [f"   Photo {i + 1}: {url}" for i, url in enumerate(show)]
+        photo_lines = [f"   Photo {i + 1}:\n   ![Listing {index} Photo {i + 1}]({url})" for i, url in enumerate(show)]
         image_line = "\n" + "\n".join(photo_lines)
         if len(images) > 3:
             image_line += f"\n   (+{len(images) - 3} more — say \"details {index}\" for all)"
     elif image_url:
-        image_line = f"\n   Photo: {image_url}"
+        image_line = f"\n   Photo:\n   ![Listing {index} Photo]({image_url})"
 
     return (
         f"{index}. {address} – {price_str}\n"
@@ -129,7 +129,13 @@ def format_listing_details(listing: dict[str, Any], index: int | None = None) ->
     photos_block = ""
     if isinstance(images, list) and len(images) > 3:
         extra = images[3:]
-        photos_block = "\n   More photos:\n" + "\n".join(f"   - {url}" for url in extra)
+        photos_block = (
+            "\n   More photos:\n"
+            + "\n\n".join(
+                f"   Photo {i + 4}:\n   ![Listing {index or 1} Photo {i + 4}]({url})"
+                for i, url in enumerate(extra)
+            )
+        )
 
     # For now we don't have reviews data from MLS, so we omit that section.
     return header + photos_block
