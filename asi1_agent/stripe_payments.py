@@ -57,15 +57,18 @@ def _expires_at() -> int:
     return int(time.time()) + sec
 
 
-def create_embedded_checkout_session(
+def create_hosted_checkout_session(
     *,
     user_address: str,
     chat_session_id: str,
     description: str,
+    service: str = "listing_details",
 ) -> dict | None:
     """
-    Create a Stripe Checkout Session for embedded UI.
-    Returns dict with client_secret, checkout_session_id, publishable_key, etc.
+    Create a Stripe hosted Checkout Session.
+    Returns dict with checkout_url and checkout_session_id.
+    User visits the URL in their browser to pay; we poll verify_checkout_session_paid()
+    when they return to chat.
     """
     if not is_configured():
         return None
@@ -74,18 +77,16 @@ def create_embedded_checkout_session(
         return None
     c = _cfg()
     try:
-        return_url = (
+        success_url = (
             f"{c['success_url']}"
             f"?session_id={{CHECKOUT_SESSION_ID}}"
             f"&chat_session_id={chat_session_id}"
-            f"&user={user_address}"
         )
         session = s.checkout.Session.create(
-            ui_mode="embedded",
-            redirect_on_completion="if_required",
             payment_method_types=["card"],
             mode="payment",
-            return_url=return_url,
+            success_url=success_url,
+            cancel_url=c["success_url"],
             expires_at=_expires_at(),
             line_items=[
                 {
@@ -103,19 +104,20 @@ def create_embedded_checkout_session(
             metadata={
                 "user_address": user_address,
                 "session_id": chat_session_id,
-                "service": "listing_details",
+                "service": service,
             },
         )
         return {
-            "client_secret": session.client_secret,
+            "checkout_url": session.url,
             "id": session.id,
             "checkout_session_id": session.id,
-            "publishable_key": c["publishable_key"],
             "currency": c["currency"],
             "amount_cents": int(c["amount_cents"]),
-            "ui_mode": "embedded",
         }
-    except Exception:
+    except Exception as exc:
+        import traceback
+        print(f"[stripe] ERROR creating hosted checkout: {exc}")
+        traceback.print_exc()
         return None
 
 
