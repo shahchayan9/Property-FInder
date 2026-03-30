@@ -423,8 +423,7 @@ def format_listings(
         "- `X bedrooms` -> change bedrooms\n"
         "- `only condos` -> filter property type\n"
         "- `details N` -> full photos + extra details\n"
-        "- `save N to my wishlist` -> save a listing\n"
-        "- `show my wishlist` -> view saved listings\n"
+        "- `send a full report to my email` -> get a complete spreadsheet emailed to you\n"
     )
     if has_more:
         text += "\n**More available:** yes (say `more`)"

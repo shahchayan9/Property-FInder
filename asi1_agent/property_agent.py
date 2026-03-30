@@ -219,7 +219,7 @@ async def _trigger_report(
         location = filters.get("location", "your area")
         description = f"Full property report — all listings in {location}"
         checkout = await asyncio.to_thread(
-            stripe_payments_mod.create_hosted_checkout_session,
+            stripe_payments_mod.create_embedded_checkout_session,
             user_address=sender,
             chat_session_id=session_id,
             description=description,
@@ -239,12 +239,23 @@ async def _trigger_report(
         _PENDING_REPORT_PAYMENTS[sid] = pending_info
         _PENDING_REPORTS_BY_SESSION[session_id] = {**pending_info, "checkout_session_id": sid}
 
-        amount_str = f"{stripe_payments_mod.get_amount_cents() / 100:.2f}"
+        amount_cents = checkout.get("amount_cents", stripe_payments_mod.get_amount_cents())
+        amount_str = f"{amount_cents / 100:.2f}"
+        currency = (checkout.get("currency") or "usd").upper()
         pay_url = checkout.get("checkout_url", "")
+        await ctx.send(
+            sender,
+            RequestPayment(
+                accepted_funds=[Funds(amount=amount_str, currency=currency, payment_method="stripe")],
+                recipient=str(ctx.agent.address),
+                deadline_seconds=1800,
+                description=description,
+                metadata={"stripe": checkout, "service": "full_report"},
+            ),
+        )
         return (
-            f"To generate your full property report for {location}, a payment of ${amount_str} is required.\n\n"
-            f"Pay here: {pay_url}\n\n"
-            f"I'll automatically detect the payment and email all listings to {email} right away."
+            f"A payment of ${amount_str} is required to generate your full property report for {location}.\n\n"
+            f"I'll automatically email all listings to {email} once payment is confirmed."
         )
     else:
         # No Stripe — send report directly
@@ -801,114 +812,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
         )
         return
 
-    # First, handle wishlist commands (save/show/clear) before normal intent flow
-    wishlist_cmd = _parse_wishlist_command(user_text)
-    if wishlist_cmd:
-        action, idx = wishlist_cmd
-        listings = _LAST_RESULTS.get(session_id) or []
-        if action == "wishlist_add":
-            # If no explicit index was provided (e.g. "add this to my wishlist"),
-            # fall back to the last listing the user referenced (via 'details N').
-            if (idx is None or not isinstance(idx, int)) and session_id in _LAST_SELECTED_INDEX:
-                idx = _LAST_SELECTED_INDEX.get(session_id)
-
-            if not listings:
-                reply_text = (
-                    "Do a property search first, then say something like "
-                    "\"save 2 to my wishlist\" or \"add the first one to my favorites.\""
-                )
-            elif not idx or not (1 <= int(idx) <= len(listings)):
-                reply_text = (
-                    "I couldn't match that to a listing. After a search you can say "
-                    "\"save 1 to my wishlist\" or \"add the second one to favorites.\""
-                )
-            else:
-                listing = listings[int(idx) - 1]
-                wl = _WISHLISTS.setdefault(session_id, [])
-                # Avoid duplicate entries for the same MLS in this session's wishlist
-                mls_new = listing.get("mls")
-                if any((item.get("mls") == mls_new and mls_new is not None) for item in wl):
-                    reply_text = (
-                        f"Listing #{idx} is already in your wishlist.\n\n"
-                        "Say \"show my wishlist\" to see everything you've saved in this chat."
-                    )
-                else:
-                    wl.append(listing)
-                    reply_text = (
-                        f"I've added listing #{idx} to your wishlist.\n\n"
-                        "Say \"show my wishlist\" to see everything you've saved in this chat."
-                    )
-        elif action == "wishlist_export":
-            saved = _WISHLISTS.get(session_id) or []
-            if not saved:
-                reply_text = (
-                    "Your wishlist is empty, so there is nothing to export.\n\n"
-                    "After a search you can save a result with \"save 1 to my wishlist\", "
-                    "then say \"export wishlist\" or \"email my wishlist to you@example.com\"."
-                )
-            else:
-                # Allow user to specify email in the message text, e.g. "export wishlist to you@example.com".
-                email_from_text = None
-                m = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", user_text or "", re.IGNORECASE)
-                if m:
-                    email_from_text = m.group(1).strip()
-
-                to_email = email_from_text or (os.getenv("EMAIL_TO") or "").strip()
-                if not to_email:
-                    reply_text = (
-                        "I can email your wishlist, but I don't know where to send it.\n\n"
-                        "Either add your email to the message (e.g. `export wishlist to you@example.com`) "
-                    )
-                else:
-                    sent = _send_wishlist_email(saved, to_email)
-                    if sent:
-                        reply_text = (
-                            f"I've emailed your wishlist to {to_email}.\n\n"
-                            "You can also view your saved listings here with \"show my wishlist\"."
-                        )
-                    else:
-                        reply_text = (
-                            "I tried to email your wishlist but something went wrong.\n\n"
-                            "Check that EMAIL_API_KEY is set with a valid Resend API key and that the "
-                            "`resend` Python package is installed in the agent environment."
-                        )
-        elif action == "wishlist_show":
-            saved = _WISHLISTS.get(session_id) or []
-            if not saved:
-                reply_text = (
-                    "Your wishlist is empty.\n\n"
-                    "After a search you can save a result by saying "
-                    "\"save 1 to my wishlist\" or \"add the second one to favorites.\""
-                )
-            else:
-                # Reuse listing formatter for consistency
-                body = format_listings_text(
-                    saved,
-                    location=None,
-                    max_price=None,
-                    page=1,
-                    has_more=False,
-                )
-                # Tweak the header text slightly
-                if body.startswith("Here are the listings:"):
-                    body = body.replace("Here are the listings:", "Here are your saved listings:", 1)
-                reply_text = body
-        else:  # wishlist_clear
-            if session_id in _WISHLISTS:
-                _WISHLISTS.pop(session_id, None)
-                reply_text = "Your wishlist has been cleared for this chat."
-            else:
-                reply_text = "Your wishlist is already empty."
-
-        reply = ChatMessage(
-            content=[TextContent(type="text", text=reply_text)],
-            msg_id=uuid4(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        await ctx.send(sender, reply)
-        return
-
-    # Otherwise, let local logic handle explicit "more"
+    # Let local logic handle explicit "more"
     intent = _detect_intent(user_text, has_state)
     local_intent = intent
 
@@ -957,38 +861,7 @@ async def on_chat(ctx: Context, sender: str, msg: ChatMessage):
                 "\"details 2\" or \"the second one\", but I couldn't match that "
                 "to a listing. Try again after a search."
             )
-        elif stripe_payments_mod.is_configured():
-            # Gate full listing details behind a small Stripe payment (hosted checkout)
-            description = f"Full details for listing #{idx}"
-            checkout = await asyncio.to_thread(
-                stripe_payments_mod.create_hosted_checkout_session,
-                user_address=sender,
-                chat_session_id=session_id,
-                description=description,
-                service="listing_details",
-            )
-            if not checkout:
-                reply_text = "Payment setup failed. Please try again or ask for details later."
-            else:
-                sid = checkout.get("checkout_session_id") or checkout.get("id")
-                _PENDING_DETAILS_PAYMENTS[sid] = {
-                    "sender": sender,
-                    "session_id": session_id,
-                    "listing_index": int(idx),
-                }
-                _PENDING_DETAILS_BY_SESSION[session_id] = {
-                    "checkout_session_id": sid,
-                    "listing_index": int(idx),
-                }
-                amount_str = f"{stripe_payments_mod.get_amount_cents() / 100:.2f}"
-                pay_url = checkout.get("checkout_url", "")
-                reply_text = (
-                    f"To unlock full details for listing #{idx}, a payment of ${amount_str} is required.\n\n"
-                    f"Pay here: {pay_url}\n\n"
-                    "I'll automatically detect the payment and send the full listing details right away."
-                )
         else:
-            # No Stripe configured: show details for free
             listing = listings[int(idx) - 1]
             _LAST_SELECTED_INDEX[session_id] = int(idx)
             mls = listing.get("mls")
