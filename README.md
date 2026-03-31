@@ -1,126 +1,135 @@
-# ASI1 Conversational Property Finder (MVP)
+# Property Finder — Conversational Real Estate Agent (MVP)
 
-A conversational Property Finder agent that runs on **ASI1** (https://asi1.ai). It accepts natural language search queries, extracts filters, fetches real-time listings from the **Repliers MLS API**, and returns formatted results. Supports follow-up refinements and “more” pagination.
+A conversational property search agent built on **ASI1** (Agentverse). Users chat in natural language to search MLS listings via the **Repliers API**, refine results, save a wishlist, and optionally export full reports to Google Sheets — with **Stripe** payment gating for premium features.
 
-- **No database, no dashboard, no CRM** — demo-ready MVP only.
+---
 
-## Project structure
+## Features
+
+- **Conversational search** — natural language queries: *"2 bed homes under $600k in Austin"*
+- **Refine on the fly** — *"under 550k"*, *"only condos"*, *"3 bedrooms"*
+- **Pagination** — say *"more"* to see the next page
+- **Wishlist** — save favorites during a session
+- **Email export** — send your wishlist via email (Resend)
+- **Full report generation** — export up to 50 listings to a Google Sheet (separate Report Agent)
+- **Payment gating** — Stripe embedded checkout for premium listing details and full reports
+
+---
+
+## Project Structure
 
 ```
-property_finder/
-├── asi1_agent/
-│   ├── property_agent.py   # ASI1 uAgent: chat handler, state, Repliers call
-│   ├── nl_parser.py        # Extract location, price, beds, property type from text
-│   ├── state_manager.py   # In-memory session filters (keyed by session ID)
+Property-FInder/
+├── asi1_agent/                  # Conversational Property Finder agent
+│   ├── property_agent.py        # Main agent: chat handler, state, Repliers calls
+│   ├── nl_parser.py             # Regex-based filter extraction
+│   ├── llm_parser.py            # OpenAI-based parsing (optional fallback)
+│   ├── state_manager.py         # In-memory session state
+│   ├── stripe_payments.py       # Stripe checkout session creation
+│   ├── payment_proto.py         # Payment protocol schema
 │   ├── requirements.txt
 │   └── .env.example
-├── repliers_client/
-│   ├── client.py           # search_listings(filters) -> listings + meta
-│   ├── filters.py          # Our filter dict -> Repliers API params
-│   └── formatter.py        # Listings -> readable chat text
-└── README.md
+├── repliers_client/             # MLS API client
+│   ├── client.py                # search_listings(filters) -> listings + meta
+│   ├── filters.py               # Internal filters -> Repliers API params
+│   └── formatter.py             # Listings -> readable chat text
+├── real_estate_agent/           # Background Report Generation agent
+│   ├── agent.py                 # Agent setup
+│   ├── workflow.py              # Fetch listings, create Google Sheet
+│   ├── sheets.py                # Google Sheets OAuth + sheet creation
+│   ├── report_models.py         # ReportRequest / ReportResponse schemas
+│   └── report_email.py          # Email delivery of reports
+├── run_agent.py                 # Entry point: Property Finder (port 8000)
+├── run_real_estate_agent.py     # Entry point: Report Agent (port 8001)
+└── .env.example                 # Configuration template
 ```
+
+---
 
 ## Setup
 
-1. **Clone/navigate** to the project (parent of `property_finder`):
-
-   ```bash
-   cd "/Users/chayanshah/Desktop/Property Finder"
-   ```
-
-2. **Create a virtualenv** (recommended):
-
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate   # Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies** (from project root):
-
-   ```bash
-   pip install -r property_finder/asi1_agent/requirements.txt
-   ```
-
-4. **Configure environment**:
-
-   ```bash
-   cp property_finder/asi1_agent/.env.example property_finder/asi1_agent/.env
-   # Edit .env: set AGENT_SECRET_KEY_1, AGENTVERSE_API_KEY, REPLIERS_API_KEY
-   ```
-
-   Or set env vars in the shell; the agent loads `.env` from its directory when run.
-
-## Run the agent
-
-**From inside `property_finder`** (recommended):
+**1. Create a virtualenv and install dependencies:**
 
 ```bash
-cd property_finder
-source venv/bin/activate   # if using a venv
-python3 run_agent.py
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r asi1_agent/requirements.txt
 ```
 
-**From project root** (parent of `property_finder`):
+**2. Configure environment variables:**
 
 ```bash
-cd "/Users/chayanshah/Desktop/Property Finder"
-python3 property_finder/run_agent.py
+cp asi1_agent/.env.example .env
+# Edit .env with your API keys (see Environment Variables below)
 ```
 
-Or as a module (from project root only):
+---
+
+## Running the Agents
+
+Open two terminals from the project root:
 
 ```bash
-cd "/Users/chayanshah/Desktop/Property Finder"
-python3 -m property_finder.asi1_agent.property_agent
+# Terminal 1 — Property Finder agent (port 8000)
+python run_agent.py
+
+# Terminal 2 — Report Generation agent (port 8001)
+python run_real_estate_agent.py
 ```
 
-You should see the agent address (e.g. `agent1q...`) and Mailbox/Almanac messages. Open https://asi1.ai, find the agent by name or address, and chat.
+Copy the Report Agent's printed address (e.g. `agent1q...`) and set it as `REAL_ESTATE_AGENT_ADDRESS` in `.env`, then restart Terminal 1.
 
-## Usage (in ASI1 chat)
+**Access:** Open [https://asi1.ai](https://asi1.ai), find the "Property Finder" agent by name or address, and start chatting.
 
-- **First message:** e.g. *“Find 2 bedroom homes under $600k in Austin.”*  
-  → Agent parses location, max price, bedrooms; calls Repliers; returns top 3 listings and hints.
+---
 
-- **Refine:** *“refine under 550k”* or *“under 550k”*  
-  → Updates `max_price`, re-queries, returns updated results.
+## Usage
 
-- **Refine:** *“only condos”* or *“change to 3 bedrooms”*  
-  → Updates filters and returns new results.
+| What you say | What happens |
+|---|---|
+| *"Find 2 bed homes under $600k in Austin"* | Parses filters, queries Repliers, returns top 3 listings |
+| *"under 550k"* or *"refine under 550k"* | Updates `max_price`, re-queries |
+| *"only condos"* or *"3 bedrooms"* | Updates property type / beds, re-queries |
+| *"more"* | Next page of results (same filters) |
+| *"wishlist"* | Shows saved listings |
+| *"export wishlist to you@example.com"* | Emails wishlist via Resend |
+| *"full report"* | Triggers Stripe checkout; on payment, generates Google Sheet |
 
-- **More:** *“more”*  
-  → Next page (same filters), returns next 3 listings.
+---
 
-## Environment variables
+## Environment Variables
 
 | Variable | Required | Purpose |
-|----------|----------|---------|
-| `AGENT_SECRET_KEY_1` | Yes | Agent seed (identity). Same value ⇒ same agent address. |
-| `AGENTVERSE_API_KEY` | Yes (for Mailbox) | API key from Agentverse; used for Mailbox/Almanac. |
-| `REPLIERS_API_KEY` | Yes | Repliers API key for `https://api.repliers.io/listings`. |
-| `USE_MAILBOX` | No (default: true) | Use Mailbox so ASI1 can deliver messages without a public URL. |
-| `AGENT_PORT` | No (default: 8000) | Local agent port. |
-| `EMAIL_API_KEY` | No (for emailing wishlist) | Resend API key (`re_...`) used to send wishlist emails. |
-| `EMAIL_TO` | No | Optional default email recipient for wishlist export (users can also type an email in chat). |
+|---|---|---|
+| `AGENT_SECRET_KEY_1` | Yes | 32-char hex seed for Property Finder agent identity |
+| `AGENTVERSE_API_KEY` | Yes | Mailbox/Almanac key from [Agentverse](https://agentverse.ai) |
+| `REPLIERS_API_KEY` | Yes | MLS listings API key from [Repliers](https://repliers.io) |
+| `OPENAI_API_KEY` | No | Enables GPT-based NLP; falls back to regex if unset |
+| `EMAIL_API_KEY` | No | [Resend](https://resend.com) key (`re_...`) for wishlist/report emails |
+| `EMAIL_TO` | No | Default recipient for `export wishlist` (no address needed in chat) |
+| `STRIPE_SECRET_KEY` | No | Stripe secret key for payment gating |
+| `STRIPE_PUBLISHABLE_KEY` | No | Stripe publishable key |
+| `STRIPE_AMOUNT_CENTS` | No | Charge amount in cents (default: `199` = $1.99) |
+| `AGENT_SECRET_KEY_2` | No | Seed for the Report Agent |
+| `REAL_ESTATE_AGENT_ADDRESS` | No | Address of running Report Agent |
+| `GOOGLE_OAUTH_CLIENT_FILE` | No | Path to `google_oauth_client.json` |
+| `GOOGLE_SHEET_SHARE_EMAIL` | No | Email to share generated Google Sheets with |
+| `USE_MAILBOX` | No | Use Agentverse Mailbox (default: `true`) |
+| `AGENT_PORT` | No | Local agent port (default: `8000`) |
 
-### Wishlist export to email
+---
 
-If `EMAIL_API_KEY` is set (Resend) the user can email their wishlist by saying:
+## Notes
 
-- `export wishlist to you@example.com`
+- **No database** — all session state (filters, wishlist) is in-memory and resets on restart.
+- **MLS coverage** — search results depend on your Repliers subscription. If a city returns nothing, try a covered market (Austin, TX works in most setups).
+- **Stripe is in test mode** by default — use Stripe test card numbers.
+- **Google Sheets OAuth** uses device flow; authenticate once and tokens are cached in `google_user_tokens.json`.
 
-If `EMAIL_TO` is set, users can also say just `export wishlist` and it will use the default recipient.
+---
 
-## Which cities/searches work?
+## Success Criteria (MVP)
 
-Listings depend on your **Repliers API / MLS coverage**. If a city returns no results (e.g. San Jose), that area may not be in the MLS your account uses. Try cities/states that are included in your Repliers subscription (e.g. Austin, TX works in many setups). The agent will suggest broadening the search or trying a different area when no listings are found.
-
-## Success criteria (MVP)
-
-- User: *“2 bed under 600k in Austin”* → agent returns 3 listings.
-- User: *“under 550k”* → agent returns updated listings.
-- User: *“more”* → agent returns next page.
-
-## Constraints (not in scope)
-
-No CMA, mortgage calculator, map, login, persistence, multi-agent, analytics, email, or voice. MVP only.
+1. *"2 bed under 600k in Austin"* → returns 3 listings
+2. *"under 550k"* → returns updated listings
+3. *"more"* → returns next page
